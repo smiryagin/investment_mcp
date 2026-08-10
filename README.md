@@ -1,6 +1,6 @@
 ﻿# Investment MCP Server
 
-Private MCP server for your SQL Server investment database.
+Private, authenticated MCP server for your SQL Server investment database.
 
 It exposes read-only tools over:
 
@@ -8,7 +8,9 @@ It exposes read-only tools over:
 - `dbo.SeriesData`
 - `dbo.TradeGetDaysChangeReturn`
 
-The server does not expose a raw SQL tool. All database access is parameterized and scoped to your investment tables/procedure.
+The server does not expose a raw SQL tool. All database access is parameterized.
+Private portfolio tools derive the caller from the bearer token and scope every
+account query to that authenticated user.
 
 ## Install
 
@@ -75,6 +77,114 @@ env = { SQLSERVER_CONN = "DRIVER={ODBC Driver 17 for SQL Server};SERVER=localhos
 - `get_watched_symbols`
 - `get_traded_symbols`
 - `get_data_freshness`
+- `get_market_indicators`
+
+Caller-scoped portfolio tools:
+
+- `get_my_accounts`
+- `get_my_portfolio`
+- `get_my_open_orders`
+- `record_trade_execution`
+- `create_limit_order_record`
+- `update_limit_order_record`
+- `cancel_limit_order_record`
+- `update_cash_balance`
+- `get_my_strategy`
+- `update_my_strategy`
+
+Explicit sharing tools:
+
+- `share_portfolio`
+- `revoke_portfolio_access`
+- `list_portfolio_access`
+- `get_shared_portfolios`
+
+Write tools require UUID idempotency keys. Concurrent updates use SQL Server
+`rowversion` values returned as hexadecimal strings.
+
+Limit-order create and update tools accept optional `duration` and `expires_on`
+fields. `duration` accepts `DAY`, `GTC`, `GTD`, `IOC`, or `FOK` (including common
+long-form aliases), and `expires_on` uses `YYYY-MM-DD`. For example, an order
+good through October 2, 2026 uses `duration="GTD"` and
+`expires_on="2026-10-02"`.
+
+## Private schema migrations
+
+Run these in order against the investment database:
+
+1. `sql/001_create_invest_schema.sql`
+2. `sql/002_add_private_tool_safety.sql`
+3. `sql/003_grant_mcp_connector_runtime.sql`
+4. `sql/004_add_database_api_tokens.sql`
+5. `sql/005_add_order_duration_expiration.sql`
+
+The second migration adds idempotency records, order status history, the
+`(UserId, AccountId, ClientOrderId)` uniqueness rule, and soft-deletion fields.
+
+## Database-backed bearer identity
+
+Each user can have multiple independently revocable tokens. SQL Server stores
+only a SHA-256 digest of each cryptographically random 256-bit token. The MCP
+runtime cannot read token hashes or issue tokens; it can only execute
+`invest.AuthenticateApiToken`.
+
+Issue a token from an administrator connection in SSMS:
+
+```sql
+EXEC invest.IssueApiToken
+    @AuthenticationSubject = N'local:andreySr',
+    @TokenName = N'Andrey Codex desktop',
+    @ExpiresAt = '2027-08-10T00:00:00-04:00';
+```
+
+Copy `PlaintextToken` from the result immediately. It is returned only once and
+must be delivered to the user through a secure channel. Configure the hosted
+service with:
+
+```text
+MCP_TOKEN_AUTH_MODE=database
+```
+
+The user's Codex configuration continues to reference an environment variable:
+
+```toml
+[mcp_servers.investments]
+url = "https://investments-mcp.torusystems.com/mcp"
+bearer_token_env_var = "INVESTMENTS_MCP_TOKEN"
+startup_timeout_sec = 30
+tool_timeout_sec = 120
+```
+
+Set `INVESTMENTS_MCP_TOKEN` to the issued plaintext token on that user's
+computer. Never store plaintext tokens in SQL Server, GitHub, logs, or support
+messages.
+
+List or revoke tokens from an administrator connection:
+
+```sql
+EXEC invest.ListApiTokens
+    @AuthenticationSubject = N'local:andreySr';
+
+EXEC invest.RevokeApiToken
+    @AuthenticationSubject = N'local:andreySr',
+    @ApiTokenId = '00000000-0000-0000-0000-000000000000';
+```
+
+### Safe migration from environment tokens
+
+1. Run migration `004` and issue a new database token.
+2. Set `MCP_TOKEN_AUTH_MODE=hybrid`, retaining the old token variables.
+3. Deploy and restart the service. Both old and database tokens work.
+4. Move every client to its new database token and verify caller isolation.
+5. Set `MCP_TOKEN_AUTH_MODE=database`, delete `MCP_BEARER_TOKEN`,
+   `MCP_DEFAULT_AUTH_SUBJECT`, and `MCP_TOKEN_SUBJECTS_JSON`, then restart.
+
+A future website should authenticate the human user, enforce subscription or
+entitlement rules separately from the token table, and call the issue/list/revoke
+procedures through a separate least-privilege database principal. The MCP runtime
+database principal must never receive token-administration permissions. For a
+public self-service integration, plan to add MCP-standard OAuth 2.1 rather than
+making permanent API keys the only login method.
 
 The research tools call `dbo.TradeGetDaysChangeReturn` by default. If that procedure returns a large result set, create the optional filtered wrapper in `sql/create_mcp_research_sp.sql` and set:
 
@@ -85,4 +195,6 @@ MCP_RESEARCH_PROCEDURE_HAS_FILTERS=true
 
 ## Important
 
-This server provides research data for analysis. It should not be connected to brokerage trading permissions, account numbers, or order-entry functions.
+The order tools record portfolio state only. They do not submit orders to a
+brokerage. Codex approval prompts are supplemental protection; authorization is
+always enforced by this server.
