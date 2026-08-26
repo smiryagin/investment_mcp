@@ -17,7 +17,7 @@ BEGIN TRY
     -- Resolve bearer authentication subjects and caller-owned accounts.
     GRANT SELECT ON OBJECT::invest.Users
         TO [mcp_connector];
-    GRANT SELECT ON OBJECT::invest.Accounts
+    GRANT SELECT, INSERT ON OBJECT::invest.Accounts
         TO [mcp_connector];
 
     -- Transaction history is append-only for the MCP runtime.

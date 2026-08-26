@@ -6,7 +6,7 @@ It exposes read-only tools over:
 
 - `dbo.Series`
 - `dbo.SeriesData`
-- `dbo.TradeGetDaysChangeReturn`
+- `dbo.InvestmentMcpGetResearch`
 
 The server does not expose a raw SQL tool. All database access is parameterized.
 Private portfolio tools derive the caller from the bearer token and scope every
@@ -34,7 +34,7 @@ CREATE USER mcp_investments_user FOR LOGIN mcp_investments_login;
 
 GRANT SELECT ON dbo.Series TO mcp_investments_user;
 GRANT SELECT ON dbo.SeriesData TO mcp_investments_user;
-GRANT EXECUTE ON dbo.TradeGetDaysChangeReturn TO mcp_investments_user;
+GRANT EXECUTE ON dbo.InvestmentMcpGetResearch TO mcp_investments_user;
 ```
 
 If you use Windows authentication instead, grant the same permissions to your Windows user.
@@ -81,8 +81,10 @@ env = { SQLSERVER_CONN = "DRIVER={ODBC Driver 17 for SQL Server};SERVER=localhos
 
 Caller-scoped portfolio tools:
 
+- `create_account`
 - `get_my_accounts`
 - `get_my_portfolio`
+- `import_opening_positions`
 - `get_my_open_orders`
 - `record_trade_execution`
 - `create_limit_order_record`
@@ -117,9 +119,39 @@ Run these in order against the investment database:
 3. `sql/003_grant_mcp_connector_runtime.sql`
 4. `sql/004_add_database_api_tokens.sql`
 5. `sql/005_add_order_duration_expiration.sql`
+6. `sql/006_add_account_and_opening_position_writes.sql`
+7. `sql/007_create_investment_mcp_research_sp.sql`
 
 The second migration adds idempotency records, order status history, the
 `(UserId, AccountId, ClientOrderId)` uniqueness rule, and soft-deletion fields.
+
+## Account setup and opening positions
+
+`create_account` creates an account owned by the authenticated caller. The tool
+does not accept a user ID, so callers cannot create accounts for other users.
+
+`import_opening_positions` establishes current holdings without reconstructing
+historical trades. Each input contains a symbol, quantity, and total cost basis:
+
+```json
+{
+  "account_id": "00000000-0000-0000-0000-000000000000",
+  "positions": [
+    {
+      "symbol": "VOO",
+      "quantity": 149.191,
+      "total_cost_basis": 92107.44
+    }
+  ],
+  "as_of": "2026-08-10T15:00:00-04:00",
+  "idempotency_key": "00000000-0000-4000-8000-000000000001"
+}
+```
+
+The import writes `OPENING_POSITION` rows to `invest.Transactions`, derives and
+stores unit cost in `Price`, and stores total cost basis in `GrossAmount`. It
+never inserts or updates `invest.CashBalances`. A unique database index prevents
+more than one active opening position for the same user, account, and symbol.
 
 ## Database-backed bearer identity
 
@@ -186,12 +218,20 @@ database principal must never receive token-administration permissions. For a
 public self-service integration, plan to add MCP-standard OAuth 2.1 rather than
 making permanent API keys the only login method.
 
-The research tools call `dbo.TradeGetDaysChangeReturn` by default. If that procedure returns a large result set, create the optional filtered wrapper in `sql/create_mcp_research_sp.sql` and set:
+The research tools call the filtered, MCP-specific procedure by default:
 
 ```text
-MCP_RESEARCH_PROCEDURE=dbo.McpGetResearch
+MCP_RESEARCH_PROCEDURE=dbo.InvestmentMcpGetResearch
 MCP_RESEARCH_PROCEDURE_HAS_FILTERS=true
 ```
+
+`IsWatched` and `IsTraded` are accepted as procedure filters but are not exposed
+in its result set. The procedure also omits `TradePrice`, `%Chng`, `StatusId`,
+`KeepMonths`, and `Rank`; the underlying score expression is used only in the
+`ORDER BY` clause to preserve result order.
+To remove additional research properties, edit only the final `SELECT` list in
+`sql/007_create_investment_mcp_research_sp.sql`, rerun the migration, and verify
+that no MCP screening tool depends on the removed field.
 
 ## Important
 

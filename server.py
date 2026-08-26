@@ -19,6 +19,7 @@ import pyodbc
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
+from pydantic import BaseModel, Field
 import uvicorn
 
 
@@ -68,11 +69,11 @@ MAX_ROWS = int(os.getenv("MCP_MAX_ROWS", "2500"))
 SQL_TIMEOUT_SECONDS = int(os.getenv("MCP_SQL_TIMEOUT_SECONDS", "30"))
 RESEARCH_PROCEDURE = os.getenv(
     "MCP_RESEARCH_PROCEDURE",
-    "dbo.TradeGetDaysChangeReturn",
+    "dbo.InvestmentMcpGetResearch",
 )
 RESEARCH_PROCEDURE_HAS_FILTERS = os.getenv(
     "MCP_RESEARCH_PROCEDURE_HAS_FILTERS",
-    "false",
+    "true",
 ).lower() in {"1", "true", "yes", "on"}
 
 READ_ONLY_TOOL = ToolAnnotations(
@@ -93,6 +94,22 @@ DESTRUCTIVE_WRITE_TOOL = ToolAnnotations(
     idempotentHint=True,
     openWorldHint=False,
 )
+
+
+class OpeningPositionInput(BaseModel):
+    """One holding to establish without changing cash."""
+
+    symbol: str = Field(description="Investment symbol, such as VOO or MSFT.")
+    quantity: float = Field(
+        gt=0,
+        allow_inf_nan=False,
+        description="Opening quantity currently held.",
+    )
+    total_cost_basis: float = Field(
+        ge=0,
+        allow_inf_nan=False,
+        description="Total cost basis for this opening quantity in account currency.",
+    )
 
 
 class BearerAuthASGI:
@@ -687,9 +704,9 @@ def _load_research_rows(
             for row in rows
             if str(row.get("AssetType", "")).lower() == asset_type.lower()
         ]
-    if watched_only:
+    if watched_only and not RESEARCH_PROCEDURE_HAS_FILTERS:
         rows = [row for row in rows if _truthy(row.get("IsWatched"))]
-    if traded_only:
+    if traded_only and not RESEARCH_PROCEDURE_HAS_FILTERS:
         rows = [row for row in rows if _truthy(row.get("IsTraded"))]
 
     return rows[:limit]
@@ -1092,6 +1109,102 @@ def get_my_accounts(ctx: Context) -> list[dict[str, Any]]:
     )
 
 
+@mcp.tool(annotations=WRITE_TOOL)
+def create_account(
+    account_name: str,
+    idempotency_key: str,
+    ctx: Context,
+    account_type: str | None = None,
+    provider_name: str | None = None,
+    provider_account_id: str | None = None,
+    base_currency: str = "USD",
+) -> dict[str, Any]:
+    """Create an investment account owned by the authenticated caller."""
+    user_id = _current_user_id(ctx)
+    normalized_name = account_name.strip()
+    normalized_type = account_type.strip() if account_type else None
+    normalized_provider = provider_name.strip() if provider_name else None
+    normalized_provider_account_id = (
+        provider_account_id.strip() if provider_account_id else None
+    )
+    normalized_currency = base_currency.strip().upper()
+    if not normalized_name or len(normalized_name) > 200:
+        raise ValueError("account_name must contain 1 to 200 characters.")
+    if normalized_type is not None and len(normalized_type) > 50:
+        raise ValueError("account_type cannot exceed 50 characters.")
+    if normalized_provider is not None and len(normalized_provider) > 100:
+        raise ValueError("provider_name cannot exceed 100 characters.")
+    if (
+        normalized_provider_account_id is not None
+        and len(normalized_provider_account_id) > 200
+    ):
+        raise ValueError("provider_account_id cannot exceed 200 characters.")
+    if normalized_provider_account_id is not None and normalized_provider is None:
+        raise ValueError(
+            "provider_name is required when provider_account_id is provided."
+        )
+    if not re.fullmatch(r"[A-Z]{3}", normalized_currency):
+        raise ValueError("base_currency must be a three-letter uppercase code.")
+    payload = {
+        "account_name": normalized_name,
+        "account_type": normalized_type,
+        "provider_name": normalized_provider,
+        "provider_account_id": normalized_provider_account_id,
+        "base_currency": normalized_currency,
+    }
+
+    def operation(cursor: pyodbc.Cursor) -> dict[str, Any]:
+        cursor.execute(
+            """
+            INSERT INTO invest.Accounts
+                (OwnerUserId, AccountName, AccountType, ProviderName,
+                 ProviderAccountId, BaseCurrency)
+            OUTPUT
+                inserted.AccountId,
+                inserted.AccountName,
+                inserted.AccountType,
+                inserted.ProviderName,
+                inserted.BaseCurrency,
+                inserted.IsActive,
+                inserted.CreatedAt,
+                inserted.UpdatedAt,
+                inserted.RowVersion
+            VALUES (?, ?, ?, ?, ?, ?);
+            """,
+            (
+                user_id,
+                normalized_name,
+                normalized_type,
+                normalized_provider,
+                normalized_provider_account_id,
+                normalized_currency,
+            ),
+        )
+        account = _rows_from_cursor(cursor)[0]
+        _write_audit(
+            cursor,
+            user_id,
+            "CREATE_ACCOUNT",
+            "Account",
+            str(account["AccountId"]),
+            {
+                "account_name": normalized_name,
+                "account_type": normalized_type,
+                "provider_name": normalized_provider,
+                "base_currency": normalized_currency,
+            },
+        )
+        return account
+
+    return _run_idempotent_write(
+        user_id,
+        "create_account",
+        idempotency_key,
+        payload,
+        operation,
+    )
+
+
 @mcp.tool(annotations=READ_ONLY_TOOL)
 def get_my_portfolio(
     ctx: Context,
@@ -1154,14 +1267,44 @@ def get_my_portfolio(
             t.Symbol,
             SUM(
                 CASE
-                    WHEN UPPER(t.TransactionType) IN ('BUY', 'PURCHASE')
+                    WHEN UPPER(t.TransactionType) IN
+                         ('BUY', 'PURCHASE', 'OPENING_POSITION')
                         THEN COALESCE(t.Quantity, 0)
                     WHEN UPPER(t.TransactionType) IN ('SELL', 'SALE')
                         THEN -COALESCE(t.Quantity, 0)
                     ELSE 0
                 END
             ) AS Quantity,
-            MAX(t.OccurredAt) AS LastActivityAt
+            MAX(t.OccurredAt) AS LastActivityAt,
+            SUM(
+                CASE
+                    WHEN UPPER(t.TransactionType) = 'OPENING_POSITION'
+                        THEN t.GrossAmount
+                    ELSE 0
+                END
+            ) AS OpeningCostBasis,
+            CASE
+                WHEN SUM(
+                    CASE
+                        WHEN UPPER(t.TransactionType) = 'OPENING_POSITION'
+                            THEN COALESCE(t.Quantity, 0)
+                        ELSE 0
+                    END
+                ) = 0 THEN NULL
+                ELSE SUM(
+                    CASE
+                        WHEN UPPER(t.TransactionType) = 'OPENING_POSITION'
+                            THEN t.GrossAmount
+                        ELSE 0
+                    END
+                ) / SUM(
+                    CASE
+                        WHEN UPPER(t.TransactionType) = 'OPENING_POSITION'
+                            THEN COALESCE(t.Quantity, 0)
+                        ELSE 0
+                    END
+                )
+            END AS OpeningAverageCost
         FROM invest.Transactions t
         JOIN invest.Accounts a
           ON a.AccountId = t.AccountId
@@ -1174,7 +1317,8 @@ def get_my_portfolio(
         GROUP BY t.AccountId, t.Symbol
         HAVING SUM(
             CASE
-                WHEN UPPER(t.TransactionType) IN ('BUY', 'PURCHASE')
+                WHEN UPPER(t.TransactionType) IN
+                     ('BUY', 'PURCHASE', 'OPENING_POSITION')
                     THEN COALESCE(t.Quantity, 0)
                 WHEN UPPER(t.TransactionType) IN ('SELL', 'SALE')
                     THEN -COALESCE(t.Quantity, 0)
@@ -1186,6 +1330,162 @@ def get_my_portfolio(
         params,
     )
     return {"accounts": accounts, "cash_balances": balances, "positions": positions}
+
+
+@mcp.tool(annotations=WRITE_TOOL)
+def import_opening_positions(
+    account_id: str,
+    positions: list[OpeningPositionInput],
+    idempotency_key: str,
+    ctx: Context,
+    as_of: str | None = None,
+) -> dict[str, Any]:
+    """Import opening quantities and cost bases without changing account cash."""
+    user_id = _current_user_id(ctx)
+    normalized_account_id = _canonical_uuid(account_id, "account_id")
+    batch_key = _canonical_uuid(idempotency_key, "idempotency_key")
+    if not positions:
+        raise ValueError("positions must contain at least one opening position.")
+    if len(positions) > 500:
+        raise ValueError("positions cannot contain more than 500 entries.")
+    try:
+        occurred = (
+            datetime.fromisoformat(as_of)
+            if as_of
+            else datetime.now().astimezone()
+        )
+    except ValueError as exc:
+        raise ValueError("as_of must be an ISO-8601 timestamp.") from exc
+    if occurred.tzinfo is None:
+        raise ValueError("as_of must include a UTC offset or timezone.")
+
+    normalized_positions: list[dict[str, Any]] = []
+    seen_symbols: set[str] = set()
+    for position in positions:
+        symbol = _clean_symbol(position.symbol)
+        if symbol in seen_symbols:
+            raise ValueError(f"positions contains duplicate symbol {symbol}.")
+        seen_symbols.add(symbol)
+        quantity = Decimal(str(position.quantity))
+        total_cost_basis = Decimal(str(position.total_cost_basis))
+        if quantity <= 0:
+            raise ValueError(f"quantity for {symbol} must be greater than zero.")
+        if total_cost_basis < 0:
+            raise ValueError(f"total_cost_basis for {symbol} cannot be negative.")
+        unit_cost = total_cost_basis / quantity
+        normalized_positions.append(
+            {
+                "symbol": symbol,
+                "quantity": str(quantity),
+                "total_cost_basis": str(total_cost_basis),
+                "unit_cost": str(unit_cost),
+            }
+        )
+
+    payload = {
+        "account_id": normalized_account_id,
+        "positions": normalized_positions,
+        "as_of": occurred.isoformat(),
+    }
+
+    def operation(cursor: pyodbc.Cursor) -> dict[str, Any]:
+        account = _require_owned_account(
+            cursor,
+            user_id,
+            normalized_account_id,
+        )
+        currency = str(account["BaseCurrency"])
+        imported: list[dict[str, Any]] = []
+        for position in normalized_positions:
+            cursor.execute(
+                """
+                SELECT 1
+                FROM invest.Transactions WITH (UPDLOCK, HOLDLOCK)
+                WHERE UserId = ?
+                  AND AccountId = ?
+                  AND Symbol = ?
+                  AND TransactionType = 'OPENING_POSITION'
+                  AND IsDeleted = 0;
+                """,
+                (user_id, normalized_account_id, position["symbol"]),
+            )
+            if _rows_from_cursor(cursor):
+                raise ValueError(
+                    f"Opening position for {position['symbol']} already exists."
+                )
+            external_id = f"opening:{batch_key}:{position['symbol']}"
+            metadata_json = json.dumps(
+                {
+                    "source": "opening_position_import",
+                    "cash_impact": False,
+                    "idempotency_key": batch_key,
+                },
+                separators=(",", ":"),
+            )
+            cursor.execute(
+                """
+                INSERT INTO invest.Transactions
+                    (UserId, AccountId, ExternalTransactionId,
+                     TransactionType, Symbol, Quantity, Price, GrossAmount,
+                     Fees, Currency, TradeDate, OccurredAt, MetadataJson)
+                OUTPUT
+                    inserted.TransactionId,
+                    inserted.AccountId,
+                    inserted.ExternalTransactionId,
+                    inserted.TransactionType,
+                    inserted.Symbol,
+                    inserted.Quantity,
+                    inserted.Price,
+                    inserted.GrossAmount,
+                    inserted.Currency,
+                    inserted.TradeDate,
+                    inserted.OccurredAt
+                VALUES
+                    (?, ?, ?, 'OPENING_POSITION', ?, ?, ?, ?, 0, ?, ?, ?, ?);
+                """,
+                (
+                    user_id,
+                    normalized_account_id,
+                    external_id,
+                    position["symbol"],
+                    Decimal(position["quantity"]),
+                    Decimal(position["unit_cost"]),
+                    Decimal(position["total_cost_basis"]),
+                    currency,
+                    occurred.date(),
+                    occurred,
+                    metadata_json,
+                ),
+            )
+            imported.append(_rows_from_cursor(cursor)[0])
+
+        _write_audit(
+            cursor,
+            user_id,
+            "IMPORT_OPENING_POSITIONS",
+            "Account",
+            normalized_account_id,
+            {
+                "position_count": len(imported),
+                "symbols": [row["Symbol"] for row in imported],
+                "as_of": occurred.isoformat(),
+                "cash_impact": False,
+            },
+        )
+        return {
+            "account_id": normalized_account_id,
+            "position_count": len(imported),
+            "cash_updated": False,
+            "positions": imported,
+        }
+
+    return _run_idempotent_write(
+        user_id,
+        "import_opening_positions",
+        batch_key,
+        payload,
+        operation,
+    )
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL)
@@ -2111,6 +2411,8 @@ Research procedure:
 
 invest.Users and invest.Accounts:
   Authenticated user identities and caller-owned investment accounts.
+  Authenticated callers can create their own accounts through an idempotent
+  write tool; callers cannot choose or impersonate an owner user ID.
 
 invest.ApiTokens:
   Hashed, expiring, independently revocable bearer credentials. Plaintext
@@ -2121,6 +2423,8 @@ invest.Transactions, invest.OpenOrders, invest.CashBalances:
   Append-oriented trade history, soft-cancelled order records, and account cash.
   Account ownership is enforced with (AccountId, UserId) foreign keys.
   Open orders include duration/time-in-force and an optional expiration date.
+  Opening-position imports preserve quantity and cost basis as transactions and
+  intentionally do not modify cash balances.
 
 invest.StrategyRules and invest.PortfolioGrants:
   Caller-owned strategy configuration and explicit portfolio sharing.
