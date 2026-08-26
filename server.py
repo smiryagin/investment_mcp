@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import re
 import secrets
@@ -8,11 +9,17 @@ import hashlib
 import json
 import logging
 import struct
+import threading
+from copy import deepcopy
 from contextlib import closing
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from time import monotonic
 from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
 from uuid import UUID
 
 import pyodbc
@@ -76,11 +83,36 @@ RESEARCH_PROCEDURE_HAS_FILTERS = os.getenv(
     "true",
 ).lower() in {"1", "true", "yes", "on"}
 
+SCHWAB_TDACONFIG_ID = int(os.getenv("SCHWAB_TDACONFIG_ID", "1"))
+SCHWAB_TOKEN_URL = os.getenv(
+    "SCHWAB_TOKEN_URL",
+    "https://api.schwabapi.com/v1/oauth/token",
+).strip()
+SCHWAB_ACCESS_TOKEN_TTL_SECONDS = int(
+    os.getenv("SCHWAB_ACCESS_TOKEN_TTL_SECONDS", "1800")
+)
+SCHWAB_ACCESS_TOKEN_REFRESH_BUFFER_SECONDS = int(
+    os.getenv("SCHWAB_ACCESS_TOKEN_REFRESH_BUFFER_SECONDS", "300")
+)
+SCHWAB_HTTP_TIMEOUT_SECONDS = int(os.getenv("SCHWAB_HTTP_TIMEOUT_SECONDS", "20"))
+SCHWAB_MARKET_DATA_BASE_URL = "https://api.schwabapi.com/marketdata/v1"
+SCHWAB_ALLOWED_API_HOST = "api.schwabapi.com"
+
+_SCHWAB_TOKEN_REFRESH_LOCK = threading.Lock()
+_SCHWAB_RESPONSE_CACHE_LOCK = threading.Lock()
+_SCHWAB_RESPONSE_CACHE: dict[str, tuple[float, Any]] = {}
+
 READ_ONLY_TOOL = ToolAnnotations(
     readOnlyHint=True,
     destructiveHint=False,
     idempotentHint=True,
     openWorldHint=False,
+)
+OPEN_WORLD_READ_ONLY_TOOL = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
 )
 WRITE_TOOL = ToolAnnotations(
     readOnlyHint=False,
@@ -405,6 +437,441 @@ def _fetch_one(sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
     return rows[0] if rows else None
 
 
+class SchwabApiError(RuntimeError):
+    """A safe, token-free description of a Schwab API failure."""
+
+
+def _as_utc_datetime(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise SchwabApiError(
+                "The Schwab token update timestamp in SQL Server is invalid."
+            ) from exc
+    else:
+        raise SchwabApiError(
+            "The Schwab token update timestamp has an unsupported type."
+        )
+
+    # dbo.TDAconfig.AccessTokenUpdateTime is a legacy datetime column. The
+    # runtime procedures write UTC, so a timezone-free value is interpreted as
+    # UTC rather than as the Windows service account's local time.
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _schwab_access_token_is_fresh(
+    config: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> bool:
+    access_token = str(config.get("AccessToken") or "").strip()
+    updated_at = _as_utc_datetime(config.get("AccessTokenUpdateTime"))
+    if not access_token or updated_at is None:
+        return False
+
+    if SCHWAB_ACCESS_TOKEN_TTL_SECONDS <= 0:
+        raise SchwabApiError("SCHWAB_ACCESS_TOKEN_TTL_SECONDS must be positive.")
+    refresh_after = max(
+        0,
+        SCHWAB_ACCESS_TOKEN_TTL_SECONDS
+        - max(0, SCHWAB_ACCESS_TOKEN_REFRESH_BUFFER_SECONDS),
+    )
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    age_seconds = (current.astimezone(timezone.utc) - updated_at).total_seconds()
+    return age_seconds < refresh_after
+
+
+def _get_schwab_oauth_config() -> dict[str, Any]:
+    if SCHWAB_TDACONFIG_ID <= 0:
+        raise SchwabApiError("SCHWAB_TDACONFIG_ID must be a positive integer.")
+    config = _fetch_one(
+        "EXEC invest.GetSchwabOAuthConfig @TDAconfigId = ?;",
+        (SCHWAB_TDACONFIG_ID,),
+    )
+    if not config:
+        raise SchwabApiError(
+            f"Schwab OAuth configuration {SCHWAB_TDACONFIG_ID} was not found."
+        )
+    return config
+
+
+def _required_schwab_config_value(config: dict[str, Any], name: str) -> str:
+    value = str(config.get(name) or "").strip()
+    if not value:
+        raise SchwabApiError(f"Schwab OAuth configuration is missing {name}.")
+    return value
+
+
+def _validated_schwab_token_url() -> str:
+    # dbo.TDAconfig.URLtoGetCode is the legacy interactive authorization URL
+    # used to obtain the initial code/refresh token. It is intentionally not
+    # used for background access-token refreshes.
+    token_url = SCHWAB_TOKEN_URL
+    parsed = urlparse(token_url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise SchwabApiError("The Schwab token URL has an invalid port.") from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or (parsed.hostname or "").lower() != SCHWAB_ALLOWED_API_HOST
+        or port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path.rstrip("/") != "/v1/oauth/token"
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise SchwabApiError(
+            "The Schwab token URL must be exactly the HTTPS Schwab OAuth "
+            "token endpoint."
+        )
+    return token_url
+
+
+def _request_new_schwab_access_token(
+    config: dict[str, Any],
+) -> tuple[str, int | None]:
+    client_id = _required_schwab_config_value(config, "client_id")
+    client_secret = _required_schwab_config_value(config, "client_secret")
+    refresh_token = _required_schwab_config_value(config, "RefreshToken")
+    token_url = _validated_schwab_token_url()
+
+    credentials = base64.b64encode(
+        f"{client_id}:{client_secret}".encode("utf-8")
+    ).decode("ascii")
+    request = Request(
+        token_url,
+        data=urlencode(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            }
+        ).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Basic {credentials}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "investment-mcp/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=SCHWAB_HTTP_TIMEOUT_SECONDS) as response:
+            payload_bytes = response.read(1_048_577)
+    except HTTPError as exc:
+        raise SchwabApiError(
+            f"Schwab OAuth refresh failed with HTTP status {exc.code}."
+        ) from exc
+    except (URLError, TimeoutError) as exc:
+        raise SchwabApiError("Schwab OAuth refresh could not reach Schwab.") from exc
+
+    if len(payload_bytes) > 1_048_576:
+        raise SchwabApiError("Schwab OAuth returned an unexpectedly large response.")
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SchwabApiError("Schwab OAuth returned invalid JSON.") from exc
+
+    if not isinstance(payload, dict):
+        raise SchwabApiError("Schwab OAuth returned an unexpected response.")
+    access_token = str(payload.get("access_token") or "").strip()
+    if not access_token:
+        raise SchwabApiError("Schwab OAuth response did not contain an access token.")
+
+    expires_in: int | None = None
+    if payload.get("expires_in") is not None:
+        try:
+            expires_in = int(payload["expires_in"])
+        except (TypeError, ValueError) as exc:
+            raise SchwabApiError(
+                "Schwab OAuth returned an invalid token lifetime."
+            ) from exc
+        if expires_in <= 0:
+            raise SchwabApiError("Schwab OAuth returned an expired access token.")
+
+    return access_token, expires_in
+
+
+def _save_schwab_access_token(access_token: str) -> None:
+    result = _fetch_one(
+        (
+            "EXEC invest.UpdateSchwabAccessToken "
+            "@TDAconfigId = ?, @AccessToken = ?;"
+        ),
+        (SCHWAB_TDACONFIG_ID, access_token),
+    )
+    if not result:
+        raise SchwabApiError("SQL Server did not save the Schwab access token.")
+
+
+def _get_schwab_access_token(*, force_refresh: bool = False) -> str:
+    """Return a usable token, refreshing it shortly before expiry when needed."""
+    with _SCHWAB_TOKEN_REFRESH_LOCK:
+        config = _get_schwab_oauth_config()
+        if not force_refresh and _schwab_access_token_is_fresh(config):
+            return _required_schwab_config_value(config, "AccessToken")
+
+        access_token, expires_in = _request_new_schwab_access_token(config)
+        if expires_in is not None and expires_in < SCHWAB_ACCESS_TOKEN_TTL_SECONDS:
+            LOGGER.warning(
+                "Schwab reported a shorter access-token lifetime (%s seconds) "
+                "than SCHWAB_ACCESS_TOKEN_TTL_SECONDS (%s seconds).",
+                expires_in,
+                SCHWAB_ACCESS_TOKEN_TTL_SECONDS,
+            )
+        _save_schwab_access_token(access_token)
+        return access_token
+
+
+def _schwab_market_data_get(
+    path: str,
+    params: dict[str, Any] | None = None,
+) -> Any:
+    """Call one Schwab market-data endpoint and retry once after a 401."""
+    cleaned_path = path.strip()
+    path_parts = cleaned_path.replace("\\", "/").split("/")
+    if (
+        not cleaned_path
+        or "://" in cleaned_path
+        or "?" in cleaned_path
+        or "#" in cleaned_path
+        or "\\" in cleaned_path
+        or any(part in {".", ".."} for part in path_parts)
+    ):
+        raise SchwabApiError("Invalid Schwab market-data path.")
+    normalized_path = "/" + cleaned_path.lstrip("/")
+    url = f"{SCHWAB_MARKET_DATA_BASE_URL}{normalized_path}"
+    if params:
+        url = f"{url}?{urlencode(params, doseq=True)}"
+
+    for attempt in range(2):
+        request = Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "Authorization": (
+                    "Bearer "
+                    + _get_schwab_access_token(force_refresh=attempt == 1)
+                ),
+                "User-Agent": "investment-mcp/1.0",
+            },
+            method="GET",
+        )
+        try:
+            with urlopen(request, timeout=SCHWAB_HTTP_TIMEOUT_SECONDS) as response:
+                payload_bytes = response.read(10_485_761)
+        except HTTPError as exc:
+            if exc.code == 401 and attempt == 0:
+                continue
+            raise SchwabApiError(
+                f"Schwab market data request failed with HTTP status {exc.code}."
+            ) from exc
+        except (URLError, TimeoutError) as exc:
+            raise SchwabApiError(
+                "Schwab market data request could not reach Schwab."
+            ) from exc
+
+        if len(payload_bytes) > 10_485_760:
+            raise SchwabApiError(
+                "Schwab market data returned an unexpectedly large response."
+            )
+        try:
+            return json.loads(payload_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SchwabApiError("Schwab market data returned invalid JSON.") from exc
+
+    raise SchwabApiError("Schwab market data authorization failed.")
+
+
+def _schwab_cached_market_data_get(
+    path: str,
+    params: dict[str, Any] | None = None,
+    *,
+    ttl_seconds: int,
+) -> Any:
+    cache_key = json.dumps(
+        {"path": path, "params": params or {}},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    now = monotonic()
+    with _SCHWAB_RESPONSE_CACHE_LOCK:
+        cached = _SCHWAB_RESPONSE_CACHE.get(cache_key)
+        if cached and cached[0] > now:
+            return deepcopy(cached[1])
+
+    payload = _schwab_market_data_get(path, params)
+    with _SCHWAB_RESPONSE_CACHE_LOCK:
+        if len(_SCHWAB_RESPONSE_CACHE) >= 1000:
+            expired_keys = [
+                key
+                for key, (expires_at, _) in _SCHWAB_RESPONSE_CACHE.items()
+                if expires_at <= now
+            ]
+            for key in expired_keys:
+                _SCHWAB_RESPONSE_CACHE.pop(key, None)
+            if len(_SCHWAB_RESPONSE_CACHE) >= 1000:
+                oldest_key = min(
+                    _SCHWAB_RESPONSE_CACHE,
+                    key=lambda key: _SCHWAB_RESPONSE_CACHE[key][0],
+                )
+                _SCHWAB_RESPONSE_CACHE.pop(oldest_key, None)
+        _SCHWAB_RESPONSE_CACHE[cache_key] = (
+            monotonic() + max(0, ttl_seconds),
+            deepcopy(payload),
+        )
+    return payload
+
+
+def _epoch_milliseconds_to_iso(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(
+            float(value) / 1000,
+            tz=timezone.utc,
+        ).isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _normalize_schwab_quote(
+    requested_symbol: str,
+    raw_quote: dict[str, Any],
+) -> dict[str, Any]:
+    quote = raw_quote.get("quote") or {}
+    reference = raw_quote.get("reference") or {}
+    fundamental = raw_quote.get("fundamental") or {}
+    if not isinstance(quote, dict):
+        quote = {}
+    if not isinstance(reference, dict):
+        reference = {}
+    if not isinstance(fundamental, dict):
+        fundamental = {}
+    symbol = str(raw_quote.get("symbol") or requested_symbol).upper()
+    return {
+        "Symbol": symbol,
+        "Name": reference.get("description"),
+        "AssetType": raw_quote.get("assetMainType"),
+        "AssetSubType": raw_quote.get("assetSubType"),
+        "Exchange": reference.get("exchangeName") or reference.get("exchange"),
+        "Realtime": raw_quote.get("realtime"),
+        "LastPrice": quote.get("lastPrice"),
+        "MarkPrice": quote.get("mark"),
+        "BidPrice": quote.get("bidPrice"),
+        "AskPrice": quote.get("askPrice"),
+        "OpenPrice": quote.get("openPrice"),
+        "HighPrice": quote.get("highPrice"),
+        "LowPrice": quote.get("lowPrice"),
+        "ClosePrice": quote.get("closePrice"),
+        "NetChange": quote.get("netChange"),
+        "NetPercentChange": quote.get("netPercentChange"),
+        "Volume": quote.get("totalVolume"),
+        "QuoteTime": _epoch_milliseconds_to_iso(quote.get("quoteTime")),
+        "PE": fundamental.get("peRatio"),
+        "EPS": fundamental.get("eps"),
+        "DividendAmount": fundamental.get("divAmount"),
+        "DividendYield": fundamental.get("divYield"),
+        "Source": "Schwab",
+    }
+
+
+def _schwab_quote_rows(
+    payload: Any,
+    requested_symbols: list[str],
+) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        raise SchwabApiError("Schwab quotes returned an unexpected response.")
+    rows: list[dict[str, Any]] = []
+    for symbol in requested_symbols:
+        raw_quote = payload.get(symbol) or payload.get(symbol.upper())
+        if isinstance(raw_quote, dict):
+            rows.append(_normalize_schwab_quote(symbol, raw_quote))
+    return rows
+
+
+def _normalize_schwab_instrument(raw: dict[str, Any]) -> dict[str, Any]:
+    fundamental = raw.get("fundamental") or {}
+    if not isinstance(fundamental, dict):
+        fundamental = {}
+    return {
+        "Symbol": raw.get("symbol"),
+        "CUSIP": raw.get("cusip"),
+        "Name": raw.get("description"),
+        "Exchange": raw.get("exchange"),
+        "AssetType": raw.get("assetType"),
+        "PE": fundamental.get("peRatio"),
+        "PEG": fundamental.get("pegRatio"),
+        "EPS": fundamental.get("eps"),
+        "DividendAmount": fundamental.get("divAmount"),
+        "DividendYield": fundamental.get("divYield"),
+        "SharesOutstanding": fundamental.get("sharesOutstanding"),
+        "ReturnOnEquity": fundamental.get("returnOnEquity"),
+        "RevenuePerShareTTM": fundamental.get("revenuePerShareTTM"),
+        "NextDividendExDate": fundamental.get("nextDivExDate"),
+        "Source": "Schwab",
+    }
+
+
+def _schwab_instrument_rows(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        raise SchwabApiError("Schwab instruments returned an unexpected response.")
+    instruments = payload.get("instruments") or []
+    if not isinstance(instruments, list):
+        raise SchwabApiError("Schwab instruments returned an unexpected response.")
+    return [
+        _normalize_schwab_instrument(item)
+        for item in instruments
+        if isinstance(item, dict)
+    ]
+
+
+def _schwab_history_rows(
+    payload: Any,
+    symbol: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        raise SchwabApiError("Schwab price history returned an unexpected response.")
+    candles = payload.get("candles") or []
+    if not isinstance(candles, list):
+        raise SchwabApiError("Schwab price history returned an unexpected response.")
+    rows = []
+    for candle in candles[-limit:]:
+        if not isinstance(candle, dict):
+            continue
+        timestamp = _epoch_milliseconds_to_iso(candle.get("datetime"))
+        rows.append(
+            {
+                "Symbol": str(payload.get("symbol") or symbol).upper(),
+                "Date": timestamp[:10] if timestamp else None,
+                "OpenValue": candle.get("open"),
+                "HighValue": candle.get("high"),
+                "LowValue": candle.get("low"),
+                "LastValue": candle.get("close"),
+                "Volume": candle.get("volume"),
+                "TradeTypeId": None,
+                "Created": None,
+                "Updated": None,
+                "Source": "Schwab",
+            }
+        )
+    return rows
+
+
 def _canonical_uuid(value: str, name: str) -> str:
     try:
         return str(UUID(value))
@@ -712,20 +1179,23 @@ def _load_research_rows(
     return rows[:limit]
 
 
-@mcp.tool(annotations=READ_ONLY_TOOL)
+@mcp.tool(annotations=OPEN_WORLD_READ_ONLY_TOOL)
 def search_symbols(
     query: str = "",
     asset_type: str | None = None,
     active_only: bool = True,
     limit: int = 25,
 ) -> list[dict[str, Any]]:
-    """Search instruments in dbo.Series by symbol, internal symbol, or name."""
+    """Search local instruments, then Schwab for symbols not in the database."""
     limit = _clamp_limit(limit, default=25)
+    cleaned_query = query.strip()
+    if len(cleaned_query) > 100 or any(ord(char) < 32 for char in cleaned_query):
+        raise ValueError("query must be 100 printable characters or fewer.")
     filters = []
     params: list[Any] = []
 
-    if query.strip():
-        pattern = f"%{query.strip()}%"
+    if cleaned_query:
+        pattern = f"%{cleaned_query}%"
         filters.append("(Symbol LIKE ? OR ISymbol LIKE ? OR Name LIKE ?)")
         params.extend([pattern, pattern, pattern])
     if asset_type:
@@ -735,7 +1205,7 @@ def search_symbols(
         filters.append("Active = 1")
 
     where = f"WHERE {' AND '.join(filters)}" if filters else ""
-    return _fetch_all(
+    local_rows = _fetch_all(
         f"""
         SELECT TOP ({limit})
             SeriesId,
@@ -766,10 +1236,40 @@ def search_symbols(
         tuple(params),
     )
 
+    results = [{**row, "Source": "SQL"} for row in local_rows]
+    if not cleaned_query or len(results) >= limit:
+        return results[:limit]
 
-@mcp.tool(annotations=READ_ONLY_TOOL)
+    try:
+        payload = _schwab_cached_market_data_get(
+            "/instruments",
+            {"symbol": cleaned_query, "projection": "symbol-search"},
+            ttl_seconds=3600,
+        )
+        external_rows = _schwab_instrument_rows(payload)
+    except SchwabApiError:
+        if results:
+            LOGGER.warning("Schwab instrument search failed; returning SQL results.")
+            return results[:limit]
+        raise
+
+    existing = {str(row.get("Symbol") or "").upper() for row in results}
+    for row in external_rows:
+        symbol = str(row.get("Symbol") or "").upper()
+        if not symbol or symbol in existing:
+            continue
+        if asset_type and str(row.get("AssetType") or "").lower() != asset_type.lower():
+            continue
+        results.append(row)
+        existing.add(symbol)
+        if len(results) >= limit:
+            break
+    return results
+
+
+@mcp.tool(annotations=OPEN_WORLD_READ_ONLY_TOOL)
 def get_symbol_profile(symbol: str) -> dict[str, Any] | None:
-    """Return profile and fundamental fields for one instrument from dbo.Series."""
+    """Return Schwab profile/fundamentals, merged with local data when present."""
     cleaned = _clean_symbol(symbol)
     rows = _fetch_all(
         """
@@ -814,46 +1314,117 @@ def get_symbol_profile(symbol: str) -> dict[str, Any] | None:
         """,
         (cleaned, cleaned),
     )
-    return rows[0] if rows else None
+    local = rows[0] if rows else None
+    try:
+        payload = _schwab_cached_market_data_get(
+            "/instruments",
+            {"symbol": cleaned, "projection": "fundamental"},
+            ttl_seconds=3600,
+        )
+        external_rows = _schwab_instrument_rows(payload)
+    except SchwabApiError:
+        if local:
+            return {**local, "Source": "SQL"}
+        raise
 
-
-@mcp.tool(annotations=READ_ONLY_TOOL)
-def get_latest_prices(symbols: list[str]) -> list[dict[str, Any]]:
-    """Return latest trade price/date fields from dbo.Series for selected symbols."""
-    cleaned = _clean_symbols(symbols)
-    placeholders = ", ".join("?" for _ in cleaned)
-    return _fetch_all(
-        f"""
-        SELECT
-            Symbol,
-            ISymbol,
-            Name,
-            TradePrice,
-            TradeDate,
-            MaxDataDate,
-            MinDataDate,
-            Updated,
-            Type,
-            AssetType,
-            AssetSubType,
-            Exchange
-        FROM dbo.Series
-        WHERE UPPER(Symbol) IN ({placeholders})
-           OR UPPER(ISymbol) IN ({placeholders})
-        ORDER BY Symbol;
-        """,
-        tuple(cleaned + cleaned),
+    external = next(
+        (
+            row
+            for row in external_rows
+            if str(row.get("Symbol") or "").upper() == cleaned
+        ),
+        external_rows[0] if external_rows else None,
     )
+    if not external:
+        return {**local, "Source": "SQL"} if local else None
+    if not local:
+        return external
+    merged = dict(local)
+    merged.update({key: value for key, value in external.items() if value is not None})
+    merged["Source"] = "Schwab+SQL"
+    return merged
 
 
-@mcp.tool(annotations=READ_ONLY_TOOL)
+@mcp.tool(annotations=OPEN_WORLD_READ_ONLY_TOOL)
+def get_latest_prices(symbols: list[str]) -> list[dict[str, Any]]:
+    """Return current Schwab quotes for any symbols, with SQL fallback."""
+    cleaned = _clean_symbols(symbols)
+    quote_by_symbol: dict[str, dict[str, Any]] = {}
+    schwab_error: SchwabApiError | None = None
+    try:
+        sorted_symbols = sorted(cleaned)
+        for start in range(0, len(sorted_symbols), 200):
+            batch = sorted_symbols[start : start + 200]
+            payload = _schwab_cached_market_data_get(
+                "/quotes",
+                {
+                    "symbols": ",".join(batch),
+                    "fields": "quote,reference,fundamental",
+                    "indicative": "false",
+                },
+                ttl_seconds=15,
+            )
+            for row in _schwab_quote_rows(payload, batch):
+                quote_by_symbol[str(row["Symbol"]).upper()] = row
+    except SchwabApiError as exc:
+        schwab_error = exc
+        LOGGER.warning("Schwab quotes failed; trying SQL fallback.")
+
+    missing = [symbol for symbol in cleaned if symbol not in quote_by_symbol]
+    if missing:
+        placeholders = ", ".join("?" for _ in missing)
+        local_rows = _fetch_all(
+            f"""
+            SELECT
+                Symbol,
+                ISymbol,
+                Name,
+                TradePrice,
+                TradeDate,
+                MaxDataDate,
+                Updated,
+                AssetType,
+                AssetSubType,
+                Exchange
+            FROM dbo.Series
+            WHERE UPPER(Symbol) IN ({placeholders})
+               OR UPPER(ISymbol) IN ({placeholders});
+            """,
+            tuple(missing + missing),
+        )
+        for row in local_rows:
+            normalized = {
+                "Symbol": row.get("Symbol"),
+                "Name": row.get("Name"),
+                "AssetType": row.get("AssetType"),
+                "AssetSubType": row.get("AssetSubType"),
+                "Exchange": row.get("Exchange"),
+                "Realtime": False,
+                "LastPrice": row.get("TradePrice"),
+                "PriceDate": row.get("TradeDate") or row.get("MaxDataDate"),
+                "Updated": row.get("Updated"),
+                "Source": "SQL",
+            }
+            for symbol_key in {
+                str(row.get("Symbol") or "").upper(),
+                str(row.get("ISymbol") or "").upper(),
+            }:
+                if symbol_key:
+                    quote_by_symbol[symbol_key] = normalized
+
+    if schwab_error and not quote_by_symbol:
+        raise schwab_error
+    return [quote_by_symbol[symbol] for symbol in cleaned if symbol in quote_by_symbol]
+
+
+@mcp.tool(annotations=OPEN_WORLD_READ_ONLY_TOOL)
 def get_price_history(
     symbol: str,
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = 2000,
 ) -> list[dict[str, Any]]:
-    """Return daily OHLCV history from dbo.SeriesData for one symbol."""
+    """Return local daily history, using Schwab when the symbol is not loaded."""
     cleaned = _clean_symbol(symbol)
     end_value = _parse_date(end_date, "end_date") or date.today()
     start_value = _parse_date(start_date, "start_date") or (
@@ -863,7 +1434,7 @@ def get_price_history(
         raise ValueError("start_date must be before or equal to end_date.")
 
     limit = _clamp_limit(limit, default=2000)
-    return _fetch_all(
+    local_rows = _fetch_all(
         f"""
         SELECT TOP ({limit})
             s.Symbol,
@@ -886,6 +1457,145 @@ def get_price_history(
         """,
         (cleaned, cleaned, start_value, end_value),
     )
+    if local_rows:
+        return [{**row, "Source": "SQL"} for row in local_rows]
+
+    start_timestamp = int(
+        datetime.combine(
+            start_value,
+            datetime_time.min,
+            tzinfo=timezone.utc,
+        ).timestamp()
+        * 1000
+    )
+    end_timestamp = int(
+        datetime.combine(
+            end_value,
+            datetime_time.max,
+            tzinfo=timezone.utc,
+        ).timestamp()
+        * 1000
+    )
+    payload = _schwab_cached_market_data_get(
+        "/pricehistory",
+        {
+            "symbol": cleaned,
+            "periodType": "year",
+            "frequencyType": "daily",
+            "frequency": 1,
+            "startDate": start_timestamp,
+            "endDate": end_timestamp,
+            "needExtendedHoursData": "false",
+            "needPreviousClose": "true",
+        },
+        ttl_seconds=900,
+    )
+    return _schwab_history_rows(payload, cleaned, limit)
+
+
+@mcp.tool(annotations=OPEN_WORLD_READ_ONLY_TOOL)
+def get_market_hours(
+    markets: list[str] | None = None,
+    market_date: str | None = None,
+) -> dict[str, Any]:
+    """Return Schwab market hours for investment markets (options excluded)."""
+    requested_markets = [
+        str(value).strip().lower() for value in (markets or ["equity", "bond"])
+    ]
+    allowed_markets = {"equity", "bond", "future", "forex"}
+    if not requested_markets or not set(requested_markets) <= allowed_markets:
+        raise ValueError("markets may contain equity, bond, future, and/or forex.")
+    requested_date = _parse_date(market_date, "market_date") or date.today()
+    payload = _schwab_cached_market_data_get(
+        "/markets",
+        {
+            "markets": ",".join(dict.fromkeys(requested_markets)),
+            "date": requested_date.isoformat(),
+        },
+        ttl_seconds=300,
+    )
+    return {
+        "Source": "Schwab",
+        "MarketDate": requested_date.isoformat(),
+        "Markets": payload,
+    }
+
+
+@mcp.tool(annotations=OPEN_WORLD_READ_ONLY_TOOL)
+def get_market_movers(
+    index_symbol: str = "$SPX",
+    sort: str = "PERCENT_CHANGE_UP",
+    frequency: int = 10,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Return Schwab movers for a supported equity market or index."""
+    normalized_index = index_symbol.strip().upper()
+    allowed_indexes = {
+        "$DJI",
+        "$COMPX",
+        "$SPX",
+        "NYSE",
+        "NASDAQ",
+        "OTCBB",
+        "INDEX_ALL",
+        "EQUITY_ALL",
+    }
+    if normalized_index not in allowed_indexes:
+        raise ValueError(
+            "index_symbol must be $DJI, $COMPX, $SPX, NYSE, NASDAQ, "
+            "OTCBB, INDEX_ALL, or EQUITY_ALL."
+        )
+    normalized_sort = sort.strip().upper()
+    allowed_sorts = {
+        "VOLUME",
+        "TRADES",
+        "PERCENT_CHANGE_UP",
+        "PERCENT_CHANGE_DOWN",
+    }
+    if normalized_sort not in allowed_sorts:
+        raise ValueError(
+            "sort must be VOLUME, TRADES, PERCENT_CHANGE_UP, or "
+            "PERCENT_CHANGE_DOWN."
+        )
+    try:
+        normalized_frequency = int(frequency)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("frequency must be 0, 1, 5, 10, 30, or 60.") from exc
+    if normalized_frequency not in {0, 1, 5, 10, 30, 60}:
+        raise ValueError("frequency must be 0, 1, 5, 10, 30, or 60.")
+    normalized_limit = _clamp_limit(limit, default=10)
+    payload = _schwab_cached_market_data_get(
+        f"/movers/{normalized_index}",
+        {"sort": normalized_sort, "frequency": normalized_frequency},
+        ttl_seconds=60,
+    )
+    screeners = payload.get("screeners", []) if isinstance(payload, dict) else []
+    if not isinstance(screeners, list):
+        raise SchwabApiError("Schwab movers returned an unexpected response.")
+    movers = []
+    for raw in screeners[:normalized_limit]:
+        if not isinstance(raw, dict):
+            continue
+        movers.append(
+            {
+                "Symbol": raw.get("symbol"),
+                "Name": raw.get("description"),
+                "LastPrice": raw.get("lastPrice"),
+                "NetChange": raw.get("netChange"),
+                "NetPercentChange": raw.get("netPercentChange"),
+                "Volume": raw.get("totalVolume"),
+                "Trades": raw.get("trades"),
+                "MarketShare": raw.get("marketShare"),
+                "Source": "Schwab",
+            }
+        )
+    return {
+        "Source": "Schwab",
+        "Index": normalized_index,
+        "Sort": normalized_sort,
+        "Frequency": normalized_frequency,
+        "Movers": movers,
+    }
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL)
@@ -2408,6 +3118,12 @@ dbo.SeriesData:
 Research procedure:
   The configured stored procedure returns performance, rank, PE, yield,
   volatility, Sharpe ratio, annualized return, and drawdown fields.
+
+Schwab market data:
+  Read-only quotes, instrument profiles, daily price history, market hours,
+  and equity/index movers. Option chains and brokerage order submission are
+  intentionally excluded. Responses are cached briefly and never expose
+  Schwab OAuth credentials.
 
 invest.Users and invest.Accounts:
   Authenticated user identities and caller-owned investment accounts.

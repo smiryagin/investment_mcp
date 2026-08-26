@@ -5,7 +5,10 @@ import hashlib
 import os
 import struct
 import unittest
-from unittest.mock import patch
+from datetime import datetime, timedelta, timezone
+from unittest.mock import call, patch
+from urllib.error import HTTPError
+from urllib.parse import parse_qs
 
 import server
 
@@ -336,6 +339,325 @@ class SqlServerTypeTests(unittest.TestCase):
         )
         value = server._decode_datetimeoffset(raw)
         self.assertEqual(value.isoformat(), "2026-08-07T15:30:10.123456-04:00")
+
+
+class SchwabOAuthTests(unittest.TestCase):
+    def test_access_token_is_refreshed_before_thirty_minute_expiration(self) -> None:
+        now = datetime(2026, 8, 26, 16, 0, tzinfo=timezone.utc)
+        config = {
+            "AccessToken": "existing-token",
+            "AccessTokenUpdateTime": (now - timedelta(minutes=24)).isoformat(),
+        }
+        with patch.object(
+            server,
+            "SCHWAB_ACCESS_TOKEN_TTL_SECONDS",
+            1800,
+        ), patch.object(
+            server,
+            "SCHWAB_ACCESS_TOKEN_REFRESH_BUFFER_SECONDS",
+            300,
+        ):
+            self.assertTrue(server._schwab_access_token_is_fresh(config, now=now))
+
+            config["AccessTokenUpdateTime"] = (
+                now - timedelta(minutes=25)
+            ).isoformat()
+            self.assertFalse(
+                server._schwab_access_token_is_fresh(config, now=now)
+            )
+
+    def test_fresh_access_token_does_not_call_schwab(self) -> None:
+        config = {
+            "AccessToken": "existing-token",
+            "AccessTokenUpdateTime": datetime.now(timezone.utc).isoformat(),
+        }
+        with patch.object(
+            server,
+            "_get_schwab_oauth_config",
+            return_value=config,
+        ), patch.object(
+            server,
+            "_request_new_schwab_access_token",
+        ) as request_token, patch.object(
+            server,
+            "_save_schwab_access_token",
+        ) as save_token:
+            token = server._get_schwab_access_token()
+
+        self.assertEqual(token, "existing-token")
+        request_token.assert_not_called()
+        save_token.assert_not_called()
+
+    def test_stale_access_token_is_refreshed_and_saved(self) -> None:
+        config = {
+            "AccessToken": "expired-token",
+            "AccessTokenUpdateTime": None,
+        }
+        with patch.object(
+            server,
+            "_get_schwab_oauth_config",
+            return_value=config,
+        ), patch.object(
+            server,
+            "_request_new_schwab_access_token",
+            return_value=("new-token", 1800),
+        ) as request_token, patch.object(
+            server,
+            "_save_schwab_access_token",
+        ) as save_token:
+            token = server._get_schwab_access_token()
+
+        self.assertEqual(token, "new-token")
+        request_token.assert_called_once_with(config)
+        save_token.assert_called_once_with("new-token")
+
+    def test_refresh_request_uses_basic_auth_and_refresh_grant(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self, limit):
+                self.limit = limit
+                return b'{"access_token":"new-token","expires_in":1800}'
+
+        config = {
+            "client_id": "test-client",
+            "client_secret": "test-secret",
+            "RefreshToken": "test-refresh-token",
+            "URLtoGetCode": (
+                "https://auth.tdameritrade.com/auth?response_type=code"
+            ),
+        }
+        response = FakeResponse()
+        with patch.object(
+            server,
+            "SCHWAB_TOKEN_URL",
+            "https://api.schwabapi.com/v1/oauth/token",
+        ), patch.object(server, "urlopen", return_value=response) as open_url:
+            token, expires_in = server._request_new_schwab_access_token(config)
+
+        self.assertEqual((token, expires_in), ("new-token", 1800))
+        request = open_url.call_args.args[0]
+        self.assertEqual(
+            request.full_url,
+            "https://api.schwabapi.com/v1/oauth/token",
+        )
+        self.assertTrue(request.get_header("Authorization").startswith("Basic "))
+        self.assertEqual(
+            parse_qs(request.data.decode("utf-8")),
+            {
+                "grant_type": ["refresh_token"],
+                "refresh_token": ["test-refresh-token"],
+            },
+        )
+
+    def test_non_schwab_token_url_is_rejected(self) -> None:
+        with patch.object(
+            server,
+            "SCHWAB_TOKEN_URL",
+            "https://example.com/v1/oauth/token",
+        ), self.assertRaisesRegex(server.SchwabApiError, "token endpoint"):
+            server._validated_schwab_token_url()
+
+    def test_market_data_retries_once_with_forced_refresh_after_401(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self, limit):
+                return b'{"symbol":"VOO"}'
+
+        unauthorized = HTTPError(
+            "https://api.schwabapi.com/marketdata/v1/quotes",
+            401,
+            "Unauthorized",
+            None,
+            None,
+        )
+        with patch.object(
+            server,
+            "_get_schwab_access_token",
+            side_effect=["old-token", "new-token"],
+        ) as get_token, patch.object(
+            server,
+            "urlopen",
+            side_effect=[unauthorized, FakeResponse()],
+        ):
+            result = server._schwab_market_data_get(
+                "/quotes",
+                {"symbols": "VOO"},
+            )
+
+        self.assertEqual(result, {"symbol": "VOO"})
+        self.assertEqual(
+            get_token.call_args_list,
+            [call(force_refresh=False), call(force_refresh=True)],
+        )
+
+
+class SchwabMarketDataToolTests(unittest.TestCase):
+    def test_investment_tools_are_registered_without_options_tool(self) -> None:
+        registered = server.mcp._tool_manager._tools
+        self.assertIn("get_market_hours", registered)
+        self.assertIn("get_market_movers", registered)
+        self.assertNotIn("get_option_chain", registered)
+        for name in {
+            "search_symbols",
+            "get_symbol_profile",
+            "get_latest_prices",
+            "get_price_history",
+            "get_market_hours",
+            "get_market_movers",
+        }:
+            self.assertTrue(registered[name].annotations.readOnlyHint, name)
+            self.assertTrue(registered[name].annotations.openWorldHint, name)
+
+    def test_live_quotes_are_normalized_without_sql_fallback(self) -> None:
+        payload = {
+            "VOO": {
+                "symbol": "VOO",
+                "assetMainType": "EQUITY",
+                "assetSubType": "ETF",
+                "realtime": True,
+                "reference": {
+                    "description": "Vanguard S&P 500 ETF",
+                    "exchangeName": "NYSE Arca",
+                },
+                "quote": {
+                    "lastPrice": 712.34,
+                    "mark": 712.30,
+                    "netPercentChange": 0.5,
+                    "quoteTime": 1787774400000,
+                },
+            }
+        }
+        with patch.object(
+            server,
+            "_schwab_cached_market_data_get",
+            return_value=payload,
+        ), patch.object(server, "_fetch_all") as fetch_all:
+            rows = server.get_latest_prices(["voo"])
+
+        fetch_all.assert_not_called()
+        self.assertEqual(rows[0]["Symbol"], "VOO")
+        self.assertEqual(rows[0]["LastPrice"], 712.34)
+        self.assertEqual(rows[0]["Source"], "Schwab")
+
+    def test_symbol_search_uses_schwab_when_local_database_has_no_match(self) -> None:
+        payload = {
+            "instruments": [
+                {
+                    "symbol": "SCHD",
+                    "description": "Schwab US Dividend Equity ETF",
+                    "assetType": "EQUITY",
+                    "exchange": "NYSE Arca",
+                }
+            ]
+        }
+        with patch.object(server, "_fetch_all", return_value=[]), patch.object(
+            server,
+            "_schwab_cached_market_data_get",
+            return_value=payload,
+        ) as schwab_get:
+            rows = server.search_symbols("SCHD")
+
+        self.assertEqual(rows[0]["Symbol"], "SCHD")
+        self.assertEqual(rows[0]["Source"], "Schwab")
+        self.assertEqual(schwab_get.call_args.args[0], "/instruments")
+
+    def test_unknown_symbol_history_uses_schwab(self) -> None:
+        payload = {
+            "symbol": "NEW",
+            "candles": [
+                {
+                    "datetime": 1787702400000,
+                    "open": 10,
+                    "high": 12,
+                    "low": 9,
+                    "close": 11,
+                    "volume": 1000,
+                }
+            ],
+        }
+        with patch.object(server, "_fetch_all", return_value=[]), patch.object(
+            server,
+            "_schwab_cached_market_data_get",
+            return_value=payload,
+        ) as schwab_get:
+            rows = server.get_price_history(
+                "NEW",
+                start_date="2026-08-25",
+                end_date="2026-08-26",
+            )
+
+        self.assertEqual(rows[0]["Symbol"], "NEW")
+        self.assertEqual(rows[0]["LastValue"], 11)
+        self.assertEqual(rows[0]["Source"], "Schwab")
+        self.assertEqual(schwab_get.call_args.args[0], "/pricehistory")
+
+    def test_cache_returns_copies_and_avoids_duplicate_provider_calls(self) -> None:
+        server._SCHWAB_RESPONSE_CACHE.clear()
+        with patch.object(
+            server,
+            "_schwab_market_data_get",
+            return_value={"value": [1]},
+        ) as provider_get:
+            first = server._schwab_cached_market_data_get(
+                "/quotes",
+                {"symbols": "VOO"},
+                ttl_seconds=15,
+            )
+            first["value"].append(2)
+            second = server._schwab_cached_market_data_get(
+                "/quotes",
+                {"symbols": "VOO"},
+                ttl_seconds=15,
+            )
+
+        provider_get.assert_called_once()
+        self.assertEqual(second, {"value": [1]})
+
+    def test_market_hours_rejects_options(self) -> None:
+        with self.assertRaisesRegex(ValueError, "equity"):
+            server.get_market_hours(markets=["option"])
+
+    def test_market_hours_and_movers_call_only_read_only_endpoints(self) -> None:
+        responses = [
+            {"equity": {"isOpen": True}},
+            {
+                "screeners": [
+                    {
+                        "symbol": "ABC",
+                        "description": "ABC Corporation",
+                        "lastPrice": 100,
+                        "netPercentChange": 5,
+                    }
+                ]
+            },
+        ]
+        with patch.object(
+            server,
+            "_schwab_cached_market_data_get",
+            side_effect=responses,
+        ) as schwab_get:
+            hours = server.get_market_hours(
+                markets=["equity"],
+                market_date="2026-08-26",
+            )
+            movers = server.get_market_movers(index_symbol="$SPX")
+
+        self.assertTrue(hours["Markets"]["equity"]["isOpen"])
+        self.assertEqual(movers["Movers"][0]["Symbol"], "ABC")
+        self.assertEqual(
+            [call_args.args[0] for call_args in schwab_get.call_args_list],
+            ["/markets", "/movers/$SPX"],
+        )
 
 
 if __name__ == "__main__":

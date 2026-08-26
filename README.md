@@ -71,6 +71,8 @@ env = { SQLSERVER_CONN = "DRIVER={ODBC Driver 17 for SQL Server};SERVER=localhos
 - `get_symbol_profile`
 - `get_latest_prices`
 - `get_price_history`
+- `get_market_hours`
+- `get_market_movers`
 - `get_research_snapshot`
 - `compare_symbols`
 - `screen_instruments`
@@ -121,9 +123,68 @@ Run these in order against the investment database:
 5. `sql/005_add_order_duration_expiration.sql`
 6. `sql/006_add_account_and_opening_position_writes.sql`
 7. `sql/007_create_investment_mcp_research_sp.sql`
+8. `sql/008_add_schwab_oauth_runtime.sql`
 
 The second migration adds idempotency records, order status history, the
 `(UserId, AccountId, ClientOrderId)` uniqueness rule, and soft-deletion fields.
+
+## Schwab OAuth access-token refresh
+
+Migration `008` creates two least-privilege procedures over the existing
+`dbo.TDAconfig` table and grants the MCP runtime account permission to execute
+only those procedures:
+
+- `invest.GetSchwabOAuthConfig`
+- `invest.UpdateSchwabAccessToken`
+
+Configure the row used by the service:
+
+```text
+SCHWAB_TDACONFIG_ID=1
+SCHWAB_TOKEN_URL=https://api.schwabapi.com/v1/oauth/token
+SCHWAB_ACCESS_TOKEN_TTL_SECONDS=1800
+SCHWAB_ACCESS_TOKEN_REFRESH_BUFFER_SECONDS=300
+SCHWAB_HTTP_TIMEOUT_SECONDS=20
+```
+
+Before each Schwab market-data request, `_get_schwab_access_token` reads the
+stored token timestamp. It reuses a token younger than 25 minutes and otherwise
+uses the refresh token to obtain a new access token, saves it with a UTC update
+timestamp, and returns it to the request. Concurrent requests in the Windows
+service are protected by an in-process lock. A market-data request that still
+receives HTTP 401 forces one refresh and one retry.
+
+Schwab market data extends the investment tools without exposing brokerage
+trading operations:
+
+- `search_symbols` searches SQL first, then Schwab instrument lookup.
+- `get_symbol_profile` merges Schwab fundamentals with local metadata.
+- `get_latest_prices` uses current Schwab quotes, with SQL fallback.
+- `get_price_history` uses SQL history first and Schwab for unknown symbols.
+- `get_market_hours` supports equity, bond, futures, and forex markets.
+- `get_market_movers` supports equity markets and major indexes.
+
+Responses are normalized before being returned. In-memory caching uses 15
+seconds for quotes, 60 seconds for movers, five minutes for market hours, 15
+minutes for external price history, and one hour for instrument data. The cache
+reduces duplicate upstream requests across MCP users and never stores Schwab
+access or refresh tokens.
+
+Option-chain and brokerage order-submission endpoints are intentionally not
+implemented. Existing order tools only record caller-owned portfolio state in
+SQL Server and never send an order to Schwab.
+
+`dbo.TDAconfig.URLtoGetCode` is preserved as the legacy interactive
+authorization URL used to obtain the initial code and refresh token. The MCP
+runtime never uses that value for background refreshes. It uses only
+`SCHWAB_TOKEN_URL` from server configuration and validates that it is Schwab's
+HTTPS token endpoint before transmitting credentials. The refresh token is not
+automatically rotated; continue the separate refresh-token renewal process
+required for the Schwab application.
+
+The migration does not grant `mcp_connector` direct access to `dbo.TDAconfig`.
+Because that legacy table contains plaintext OAuth secrets, restrict database
+administrator access, encrypted backups, and SQL diagnostic logging accordingly.
 
 ## Account setup and opening positions
 
