@@ -4,7 +4,7 @@ Private, authenticated MCP server for your SQL Server investment database.
 
 It exposes read-only tools over:
 
-- `dbo.Series`
+- `invest.McpInstruments`
 - `dbo.SeriesData`
 - `dbo.InvestmentMcpGetResearch`
 
@@ -32,7 +32,8 @@ Use a read-only SQL login/user if possible:
 CREATE LOGIN mcp_investments_login WITH PASSWORD = 'replace-with-strong-password';
 CREATE USER mcp_investments_user FOR LOGIN mcp_investments_login;
 
-GRANT SELECT ON dbo.Series TO mcp_investments_user;
+GRANT SELECT ON invest.McpInstruments TO mcp_investments_user;
+DENY SELECT ON dbo.Series TO mcp_investments_user;
 GRANT SELECT ON dbo.SeriesData TO mcp_investments_user;
 GRANT EXECUTE ON dbo.InvestmentMcpGetResearch TO mcp_investments_user;
 ```
@@ -124,9 +125,19 @@ Run these in order against the investment database:
 6. `sql/006_add_account_and_opening_position_writes.sql`
 7. `sql/007_create_investment_mcp_research_sp.sql`
 8. `sql/008_add_schwab_oauth_runtime.sql`
+9. `sql/009_create_mcp_instruments_view.sql`
+10. `sql/010_add_api_token_usage_log.sql`
+11. `sql/011_limit_active_api_tokens.sql`
 
 The second migration adds idempotency records, order status history, the
 `(UserId, AccountId, ClientOrderId)` uniqueness rule, and soft-deletion fields.
+
+Migration `009` creates `invest.McpInstruments`, a least-privilege view over the
+instrument fields used by the MCP. It includes active rows only; excludes the
+internal `TEMP` and `PORTF` calculation series; and omits status, watch/trade,
+fallback-price, alternate-symbol, and data-range fields. It grants
+`mcp_connector` access to the view and denies direct reads from `dbo.Series`.
+Watched/traded tools use the filtered research procedure instead of the view.
 
 ## Schwab OAuth access-token refresh
 
@@ -169,6 +180,100 @@ seconds for quotes, 60 seconds for movers, five minutes for market hours, 15
 minutes for external price history, and one hour for instrument data. The cache
 reduces duplicate upstream requests across MCP users and never stores Schwab
 access or refresh tokens.
+
+## Rate limits and Schwab units
+
+Limits aggregate by the authenticated database `UserId`, not by bearer token,
+so issuing multiple tokens does not multiply a user's allowance. The defaults
+are:
+
+- all MCP tools: 30 calls/minute/token with a burst of 10;
+- all MCP tools: 60 calls/minute/user with a burst of 15;
+- authenticated POST requests: at most 2 concurrent requests/token and 4/user;
+- Schwab cache misses: 6 units/minute/user with a burst of 3 requests;
+- Schwab daily allowance: 100 units/user/UTC day;
+- external history: 2 calls/minute/user and 20 calls/user/UTC day;
+- quotes: at most 200 unique symbols per tool call;
+- shared Schwab capacity: 60 upstream requests/minute, burst 10, and at most 5
+  concurrent requests.
+
+SQL-only work and Schwab cache hits cost zero Schwab units. Instrument search,
+profiles, market hours, and movers cost 1 unit. Quotes cost 1 unit for 1-50
+symbols, 2 for 51-100, 3 for 101-150, and 4 for 151-200. External price history
+costs 5 units. A Schwab HTTP 401 retry consumes another global upstream request
+but does not charge the user twice for the same logical cache miss.
+
+When a limit is reached, the tool returns a structured error containing
+`error=rate_limit_exceeded`, a safe human-readable `message`, the limiting
+scope, and `retry_after_seconds`.
+Because MCP tool failures are JSON-RPC results, this retry value is carried in
+the tool error rather than an HTTP `Retry-After` response header.
+
+The defaults can be adjusted with:
+
+```text
+MCP_USER_RATE_PER_MINUTE=60
+MCP_USER_BURST=15
+MCP_TOKEN_RATE_PER_MINUTE=30
+MCP_TOKEN_BURST=10
+MCP_TOKEN_MAX_CONCURRENT_REQUESTS=2
+MCP_USER_MAX_CONCURRENT_REQUESTS=4
+SCHWAB_USER_UNITS_PER_MINUTE=6
+SCHWAB_USER_REQUEST_BURST=3
+SCHWAB_USER_DAILY_UNITS=100
+SCHWAB_HISTORY_CALLS_PER_MINUTE=2
+SCHWAB_HISTORY_BURST=2
+SCHWAB_HISTORY_DAILY_CALLS=20
+SCHWAB_GLOBAL_REQUESTS_PER_MINUTE=60
+SCHWAB_GLOBAL_BURST=10
+SCHWAB_MAX_CONCURRENT_REQUESTS=5
+SCHWAB_MAX_QUOTE_SYMBOLS=200
+```
+
+These counters are in process, which is appropriate for the current single
+NSSM Windows service. They reset when `InvestmentMcp` restarts. Before running
+multiple MCP processes or servers, move the counters to Redis or another shared
+atomic store. Set the global request allowance no higher than the confirmed
+quota for the Schwab developer application; 60/minute is a conservative
+provisional value, not a statement of Schwab entitlement.
+
+## API token usage telemetry
+
+Migration `010` creates `invest.ApiTokenUsageLog`, the insert-only
+`invest.RecordApiTokenUsage` runtime procedure, and the aggregate
+`invest.ApiTokenUsageDaily` reporting view. The runtime login can execute the
+insert procedure but cannot read, insert, update, or delete the table directly.
+
+Each authenticated database-token POST records:
+
+- `UserId` and `ApiTokenId`;
+- request start/end, duration, HTTP status, outcome, and response size;
+- MCP RPC method and tool name, but not tool arguments;
+- Schwab units, actual upstream requests, and cache hits;
+- hostname, Cloudflare Ray ID, country, IP/network according to privacy mode,
+  user agent, and hashed MCP session/client fingerprint values;
+- rate-limit scope and a safe exception type when applicable.
+
+Bearer tokens, authorization headers, request arguments, response bodies,
+portfolio data, and Schwab credentials are never written to the usage table.
+Legacy environment tokens are not persisted because they have no database
+`ApiTokenId`; database-backed tokens are required for usage reports.
+
+Configure telemetry with:
+
+```text
+MCP_TOKEN_USAGE_LOG_ENABLED=true
+MCP_TOKEN_USAGE_IP_MODE=prefix
+MCP_TOKEN_USAGE_MAX_CAPTURE_BYTES=131072
+```
+
+`prefix` is the recommended IP mode and stores IPv4 `/24` or IPv6 `/64`
+networks. `full` additionally stores the exact client IP; use it only with a
+documented retention and privacy policy. `none` stores neither IP nor network.
+The service trusts `CF-Connecting-IP` because its listener is private behind the
+Cloudflare Tunnel; do not trust that header if the origin later becomes directly
+Internet-accessible. Establish a retention job before public launch (for
+example, retain detailed rows for 90 days and retain daily aggregates longer).
 
 Option-chain and brokerage order-submission endpoints are intentionally not
 implemented. Existing order tools only record caller-owned portfolio state in
@@ -216,10 +321,14 @@ more than one active opening position for the same user, account, and symbol.
 
 ## Database-backed bearer identity
 
-Each user can have multiple independently revocable tokens. SQL Server stores
+Each user can have at most two active, independently revocable tokens. Expired
+and revoked tokens do not count toward the limit. SQL Server stores
 only a SHA-256 digest of each cryptographically random 256-bit token. The MCP
 runtime cannot read token hashes or issue tokens; it can only execute
 `invest.AuthenticateApiToken`.
+
+After migration `004`, run `sql/011_limit_active_api_tokens.sql` to enforce the
+two-active-token maximum in `invest.IssueApiToken`.
 
 Issue a token from an administrator connection in SSMS:
 

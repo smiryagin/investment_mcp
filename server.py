@@ -6,12 +6,15 @@ import os
 import re
 import secrets
 import hashlib
+import ipaddress
 import json
 import logging
 import struct
 import threading
 from copy import deepcopy
-from contextlib import closing
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -62,9 +65,11 @@ mcp = FastMCP(
             "localhost:8000",
             "localhost:*",
             "investments-mcp.torusystems.com",
+            "mcp.wiselinetrade.com",
         ],
         allowed_origins=[
             "https://investments-mcp.torusystems.com",
+            "https://mcp.wiselinetrade.com",
         ],
     ),
 )
@@ -97,6 +102,54 @@ SCHWAB_ACCESS_TOKEN_REFRESH_BUFFER_SECONDS = int(
 SCHWAB_HTTP_TIMEOUT_SECONDS = int(os.getenv("SCHWAB_HTTP_TIMEOUT_SECONDS", "20"))
 SCHWAB_MARKET_DATA_BASE_URL = "https://api.schwabapi.com/marketdata/v1"
 SCHWAB_ALLOWED_API_HOST = "api.schwabapi.com"
+
+MCP_USER_RATE_PER_MINUTE = int(os.getenv("MCP_USER_RATE_PER_MINUTE", "60"))
+MCP_USER_BURST = int(os.getenv("MCP_USER_BURST", "15"))
+MCP_TOKEN_RATE_PER_MINUTE = int(
+    os.getenv("MCP_TOKEN_RATE_PER_MINUTE", "30")
+)
+MCP_TOKEN_BURST = int(os.getenv("MCP_TOKEN_BURST", "10"))
+MCP_TOKEN_MAX_CONCURRENT_REQUESTS = int(
+    os.getenv("MCP_TOKEN_MAX_CONCURRENT_REQUESTS", "2")
+)
+MCP_USER_MAX_CONCURRENT_REQUESTS = int(
+    os.getenv("MCP_USER_MAX_CONCURRENT_REQUESTS", "4")
+)
+MCP_TOKEN_USAGE_LOG_ENABLED = os.getenv(
+    "MCP_TOKEN_USAGE_LOG_ENABLED",
+    "true",
+).lower() in {"1", "true", "yes", "on"}
+MCP_TOKEN_USAGE_IP_MODE = os.getenv(
+    "MCP_TOKEN_USAGE_IP_MODE",
+    "prefix",
+).strip().lower()
+if MCP_TOKEN_USAGE_IP_MODE not in {"none", "prefix", "full"}:
+    raise RuntimeError("MCP_TOKEN_USAGE_IP_MODE must be none, prefix, or full.")
+MCP_TOKEN_USAGE_MAX_CAPTURE_BYTES = max(
+    0,
+    min(
+        int(os.getenv("MCP_TOKEN_USAGE_MAX_CAPTURE_BYTES", "131072")),
+        1_048_576,
+    ),
+)
+SCHWAB_USER_UNITS_PER_MINUTE = int(
+    os.getenv("SCHWAB_USER_UNITS_PER_MINUTE", "6")
+)
+SCHWAB_USER_REQUEST_BURST = int(os.getenv("SCHWAB_USER_REQUEST_BURST", "3"))
+SCHWAB_USER_DAILY_UNITS = int(os.getenv("SCHWAB_USER_DAILY_UNITS", "100"))
+SCHWAB_HISTORY_CALLS_PER_MINUTE = int(
+    os.getenv("SCHWAB_HISTORY_CALLS_PER_MINUTE", "2")
+)
+SCHWAB_HISTORY_BURST = int(os.getenv("SCHWAB_HISTORY_BURST", "2"))
+SCHWAB_HISTORY_DAILY_CALLS = int(os.getenv("SCHWAB_HISTORY_DAILY_CALLS", "20"))
+SCHWAB_GLOBAL_REQUESTS_PER_MINUTE = int(
+    os.getenv("SCHWAB_GLOBAL_REQUESTS_PER_MINUTE", "60")
+)
+SCHWAB_GLOBAL_BURST = int(os.getenv("SCHWAB_GLOBAL_BURST", "10"))
+SCHWAB_MAX_CONCURRENT_REQUESTS = int(
+    os.getenv("SCHWAB_MAX_CONCURRENT_REQUESTS", "5")
+)
+SCHWAB_MAX_QUOTE_SYMBOLS = int(os.getenv("SCHWAB_MAX_QUOTE_SYMBOLS", "200"))
 
 _SCHWAB_TOKEN_REFRESH_LOCK = threading.Lock()
 _SCHWAB_RESPONSE_CACHE_LOCK = threading.Lock()
@@ -144,16 +197,82 @@ class OpeningPositionInput(BaseModel):
     )
 
 
+@dataclass(frozen=True)
+class AuthIdentity:
+    authentication_subject: str
+    user_id: str | None
+    api_token_id: str | None
+    token_key: str
+
+
+@dataclass
+class RequestUsageMetrics:
+    schwab_units: int = 0
+    schwab_upstream_requests: int = 0
+    schwab_cache_hits: int = 0
+    rate_limit_scope: str | None = None
+
+
+_REQUEST_USAGE_METRICS: ContextVar[RequestUsageMetrics | None] = ContextVar(
+    "investment_mcp_request_usage",
+    default=None,
+)
+
+
+class _KeyedConcurrencyLimiter:
+    def __init__(self, limit: int) -> None:
+        self.limit = max(1, int(limit))
+        self._lock = threading.Lock()
+        self._active: dict[str, int] = {}
+
+    def try_acquire(self, key: str) -> bool:
+        with self._lock:
+            active = self._active.get(key, 0)
+            if active >= self.limit:
+                return False
+            self._active[key] = active + 1
+            return True
+
+    def release(self, key: str) -> None:
+        with self._lock:
+            active = self._active.get(key, 0)
+            if active <= 1:
+                self._active.pop(key, None)
+            else:
+                self._active[key] = active - 1
+
+    def active(self, key: str) -> int:
+        with self._lock:
+            return self._active.get(key, 0)
+
+
+_TOKEN_CONCURRENCY_LIMITER = _KeyedConcurrencyLimiter(
+    MCP_TOKEN_MAX_CONCURRENT_REQUESTS
+)
+_USER_CONCURRENCY_LIMITER = _KeyedConcurrencyLimiter(
+    MCP_USER_MAX_CONCURRENT_REQUESTS
+)
+
+
 class BearerAuthASGI:
     def __init__(
         self,
         app: Any,
-        token_resolver: Callable[[str], str | None],
+        token_resolver: Callable[[str], AuthIdentity | str | None],
         protected_path: str,
+        *,
+        token_concurrency_limiter: _KeyedConcurrencyLimiter | None = None,
+        user_concurrency_limiter: _KeyedConcurrencyLimiter | None = None,
     ) -> None:
         self.app = app
         self.token_resolver = token_resolver
         self.protected_path = protected_path.rstrip("/") or "/"
+        self.token_concurrency_limiter = (
+            token_concurrency_limiter or _TOKEN_CONCURRENCY_LIMITER
+        )
+        self.user_concurrency_limiter = (
+            user_concurrency_limiter or _USER_CONCURRENCY_LIMITER
+        )
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") == "http" and self._is_protected_path(scope):
@@ -169,7 +288,7 @@ class BearerAuthASGI:
                 return
 
             try:
-                authentication_subject = await asyncio.to_thread(
+                resolved_identity = await asyncio.to_thread(
                     self.token_resolver,
                     token,
                 )
@@ -178,14 +297,80 @@ class BearerAuthASGI:
                 await self._service_unavailable(send)
                 return
 
-            if not authentication_subject:
+            if not resolved_identity:
                 await self._unauthorized(send)
                 return
 
+            if isinstance(resolved_identity, AuthIdentity):
+                identity = resolved_identity
+            else:
+                authentication_subject = str(resolved_identity).strip()
+                if not authentication_subject:
+                    await self._unauthorized(send)
+                    return
+                identity = AuthIdentity(
+                    authentication_subject=authentication_subject,
+                    user_id=None,
+                    api_token_id=None,
+                    token_key=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                )
+
             scope = dict(scope)
             state = dict(scope.get("state") or {})
-            state["authentication_subject"] = authentication_subject
+            state["authentication_subject"] = identity.authentication_subject
+            if identity.user_id:
+                state["user_id"] = identity.user_id
+            if identity.api_token_id:
+                state["api_token_id"] = identity.api_token_id
+            # This is an API-token UUID for database tokens and a SHA-256
+            # digest for temporary legacy tokens. The plaintext bearer token
+            # is never copied into request state or logs.
+            state["token_rate_key"] = identity.token_key
             scope["state"] = state
+
+            # Streamable HTTP uses POST for JSON-RPC requests. Long-lived GET
+            # streams authenticate normally but do not occupy concurrency slots.
+            if str(scope.get("method") or "").upper() == "POST":
+                user_key = identity.user_id or identity.authentication_subject
+                if not self.token_concurrency_limiter.try_acquire(
+                    identity.token_key
+                ):
+                    LOGGER.warning(
+                        "Token concurrency limit exceeded: api_token_id=%s "
+                        "user_id=%s limit=%s",
+                        identity.api_token_id or "legacy",
+                        identity.user_id or "legacy",
+                        self.token_concurrency_limiter.limit,
+                    )
+                    await self._too_many_requests(
+                        send,
+                        scope_name="token_concurrency",
+                        limit=self.token_concurrency_limiter.limit,
+                    )
+                    return
+
+                if not self.user_concurrency_limiter.try_acquire(user_key):
+                    self.token_concurrency_limiter.release(identity.token_key)
+                    LOGGER.warning(
+                        "User concurrency limit exceeded: user_id=%s limit=%s",
+                        identity.user_id or identity.authentication_subject,
+                        self.user_concurrency_limiter.limit,
+                    )
+                    await self._too_many_requests(
+                        send,
+                        scope_name="user_concurrency",
+                        limit=self.user_concurrency_limiter.limit,
+                    )
+                    return
+
+                await self._run_observed_request(
+                    scope,
+                    receive,
+                    send,
+                    identity=identity,
+                    user_key=user_key,
+                )
+                return
 
         await self.app(scope, receive, send)
 
@@ -199,6 +384,103 @@ class BearerAuthASGI:
             if key.lower() == wanted:
                 return value.decode("latin1")
         return ""
+
+    async def _run_observed_request(
+        self,
+        scope: dict[str, Any],
+        receive: Any,
+        send: Any,
+        *,
+        identity: AuthIdentity,
+        user_key: str,
+    ) -> None:
+        started_at = datetime.now(timezone.utc)
+        started_monotonic = monotonic()
+        captured_body = bytearray()
+        captured_response = bytearray()
+        request_bytes = 0
+        response_bytes = 0
+        response_status = 500
+        error_type: str | None = None
+        metrics = RequestUsageMetrics()
+        metrics_token = _REQUEST_USAGE_METRICS.set(metrics)
+
+        async def observed_receive() -> dict[str, Any]:
+            nonlocal request_bytes
+            message = await receive()
+            if message.get("type") == "http.request":
+                body = bytes(message.get("body") or b"")
+                request_bytes += len(body)
+                remaining = max(
+                    0,
+                    MCP_TOKEN_USAGE_MAX_CAPTURE_BYTES - len(captured_body),
+                )
+                if remaining:
+                    captured_body.extend(body[:remaining])
+            return message
+
+        async def observed_send(message: dict[str, Any]) -> None:
+            nonlocal response_bytes, response_status
+            if message.get("type") == "http.response.start":
+                response_status = int(message.get("status") or 500)
+            elif message.get("type") == "http.response.body":
+                body = bytes(message.get("body") or b"")
+                response_bytes += len(body)
+                remaining = max(
+                    0,
+                    MCP_TOKEN_USAGE_MAX_CAPTURE_BYTES - len(captured_response),
+                )
+                if remaining:
+                    captured_response.extend(body[:remaining])
+            await send(message)
+
+        try:
+            await self.app(scope, observed_receive, observed_send)
+        except asyncio.CancelledError:
+            error_type = "CancelledError"
+            raise
+        except Exception as exc:
+            error_type = type(exc).__name__[:100]
+            raise
+        finally:
+            completed_at = datetime.now(timezone.utc)
+            duration_ms = max(
+                0,
+                int((monotonic() - started_monotonic) * 1000),
+            )
+            self.user_concurrency_limiter.release(user_key)
+            self.token_concurrency_limiter.release(identity.token_key)
+            _REQUEST_USAGE_METRICS.reset(metrics_token)
+
+            if (
+                MCP_TOKEN_USAGE_LOG_ENABLED
+                and identity.api_token_id
+                and identity.user_id
+            ):
+                try:
+                    await asyncio.to_thread(
+                        _record_api_token_usage,
+                        identity=identity,
+                        scope=scope,
+                        captured_body=bytes(captured_body),
+                        captured_response=bytes(captured_response),
+                        request_bytes=request_bytes,
+                        response_bytes=response_bytes,
+                        response_status=response_status,
+                        started_at=started_at,
+                        completed_at=completed_at,
+                        duration_ms=duration_ms,
+                        error_type=error_type,
+                        metrics=metrics,
+                    )
+                except Exception:
+                    # Telemetry must never change the result of an MCP request.
+                    LOGGER.exception(
+                        "Failed to record API token usage: api_token_id=%s "
+                        "user_id=%s",
+                        identity.api_token_id,
+                        identity.user_id,
+                    )
 
     async def _unauthorized(self, send: Any) -> None:
         await send(
@@ -227,6 +509,36 @@ class BearerAuthASGI:
                 "body": b"Authentication service unavailable",
             }
         )
+
+    async def _too_many_requests(
+        self,
+        send: Any,
+        *,
+        scope_name: str,
+        limit: int,
+    ) -> None:
+        payload = json.dumps(
+            {
+                "error": "concurrency_limit_exceeded",
+                "message": _limit_message(scope_name, 1),
+                "scope": scope_name,
+                "retry_after_seconds": 1,
+                "limit": limit,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 429,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"retry-after", b"1"),
+                    (b"content-length", str(len(payload)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": payload})
 
 
 def _load_token_subjects() -> dict[str, str]:
@@ -284,7 +596,7 @@ def _resolve_legacy_token(
     return token_subjects.get(matched_hash) if matched_hash else None
 
 
-def _resolve_database_token(token: str) -> str | None:
+def _resolve_database_token(token: str) -> AuthIdentity | None:
     """Resolve a bearer token through the least-privilege SQL procedure."""
     token_hash = hashlib.sha256(token.encode("utf-8")).digest()
     row = _fetch_one(
@@ -294,10 +606,19 @@ def _resolve_database_token(token: str) -> str | None:
     if not row:
         return None
     subject = str(row.get("AuthenticationSubject") or "").strip()
-    return subject or None
+    if not subject:
+        return None
+    api_token_id = str(row.get("ApiTokenId") or "").strip() or None
+    user_id = str(row.get("UserId") or "").strip() or None
+    return AuthIdentity(
+        authentication_subject=subject,
+        user_id=user_id,
+        api_token_id=api_token_id,
+        token_key=api_token_id or token_hash.hex(),
+    )
 
 
-def _build_token_resolver() -> Callable[[str], str | None]:
+def _build_token_resolver() -> Callable[[str], AuthIdentity | None]:
     legacy_tokens = _load_token_subjects()
     configured_mode = os.getenv("MCP_TOKEN_AUTH_MODE", "").strip().lower()
     mode = configured_mode or ("legacy" if legacy_tokens else "database")
@@ -311,10 +632,10 @@ def _build_token_resolver() -> Callable[[str], str | None]:
             "MCP_TOKEN_SUBJECTS_JSON."
         )
 
-    def resolve(token: str) -> str | None:
+    def resolve(token: str) -> AuthIdentity | None:
         if mode in {"database", "hybrid"}:
             try:
-                subject = _resolve_database_token(token)
+                identity = _resolve_database_token(token)
             except pyodbc.Error:
                 if mode == "database":
                     raise
@@ -322,11 +643,18 @@ def _build_token_resolver() -> Callable[[str], str | None]:
                     "Database token validation failed; trying temporary legacy fallback."
                 )
             else:
-                if subject:
-                    return subject
+                if identity:
+                    return identity
 
         if mode in {"legacy", "hybrid"}:
-            return _resolve_legacy_token(token, legacy_tokens)
+            subject = _resolve_legacy_token(token, legacy_tokens)
+            if subject:
+                return AuthIdentity(
+                    authentication_subject=subject,
+                    user_id=None,
+                    api_token_id=None,
+                    token_key=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                )
         return None
 
     return resolve
@@ -437,8 +765,547 @@ def _fetch_one(sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
     return rows[0] if rows else None
 
 
+def _scope_header(scope: dict[str, Any], name: str) -> str:
+    wanted = name.lower().encode("latin1")
+    for key, value in scope.get("headers", []):
+        if key.lower() == wanted:
+            return value.decode("latin1", errors="replace").strip()
+    return ""
+
+
+def _limited_text(value: Any, length: int) -> str | None:
+    cleaned = str(value or "").strip()
+    return cleaned[:length] if cleaned else None
+
+
+def _parse_mcp_request_metadata(body: bytes) -> tuple[str | None, str | None]:
+    if not body or len(body) >= MCP_TOKEN_USAGE_MAX_CAPTURE_BYTES:
+        return None, None
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(payload, dict):
+        return "batch" if isinstance(payload, list) else None, None
+    rpc_method = _limited_text(payload.get("method"), 100)
+    params = payload.get("params")
+    tool_name = None
+    if rpc_method == "tools/call" and isinstance(params, dict):
+        tool_name = _limited_text(params.get("name"), 200)
+    return rpc_method, tool_name
+
+
+def _parse_mcp_response_error(body: bytes) -> str | None:
+    if not body or len(body) >= MCP_TOKEN_USAGE_MAX_CAPTURE_BYTES:
+        return None
+    try:
+        decoded = body.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+    if decoded.startswith("data:"):
+        decoded = "\n".join(
+            line[5:].lstrip()
+            for line in decoded.splitlines()
+            if line.startswith("data:")
+        )
+    try:
+        payload = json.loads(decoded)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if isinstance(payload.get("error"), dict):
+        return "JsonRpcError"
+    result = payload.get("result")
+    if isinstance(result, dict) and result.get("isError") is True:
+        return "ToolError"
+    return None
+
+
+def _client_network_metadata(
+    scope: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    raw_ip = _scope_header(scope, "cf-connecting-ip")
+    if not raw_ip:
+        client = scope.get("client")
+        if isinstance(client, (tuple, list)) and client:
+            raw_ip = str(client[0])
+    try:
+        address = ipaddress.ip_address(raw_ip)
+    except ValueError:
+        return None, None
+
+    prefix_length = 24 if address.version == 4 else 64
+    network = str(
+        ipaddress.ip_network(f"{address}/{prefix_length}", strict=False)
+    )
+    stored_ip = str(address) if MCP_TOKEN_USAGE_IP_MODE == "full" else None
+    stored_network = network if MCP_TOKEN_USAGE_IP_MODE != "none" else None
+    return stored_ip, stored_network
+
+
+def _record_api_token_usage(
+    *,
+    identity: AuthIdentity,
+    scope: dict[str, Any],
+    captured_body: bytes,
+    captured_response: bytes,
+    request_bytes: int,
+    response_bytes: int,
+    response_status: int,
+    started_at: datetime,
+    completed_at: datetime,
+    duration_ms: int,
+    error_type: str | None,
+    metrics: RequestUsageMetrics,
+) -> None:
+    if not identity.api_token_id or not identity.user_id:
+        return
+
+    rpc_method, tool_name = _parse_mcp_request_metadata(captured_body)
+    mcp_error_type = _parse_mcp_response_error(captured_response)
+    client_ip, client_network = _client_network_metadata(scope)
+    client_country = _limited_text(_scope_header(scope, "cf-ipcountry"), 8)
+    user_agent = _limited_text(_scope_header(scope, "user-agent"), 512)
+    cf_ray_id = _limited_text(_scope_header(scope, "cf-ray"), 100)
+    session_id = _scope_header(scope, "mcp-session-id")
+    session_hash = (
+        hashlib.sha256(session_id.encode("utf-8")).digest()
+        if session_id
+        else None
+    )
+    fingerprint_source = "|".join(
+        value
+        for value in (client_ip or client_network, client_country, user_agent)
+        if value
+    )
+    fingerprint_hash = (
+        hashlib.sha256(fingerprint_source.encode("utf-8")).digest()
+        if fingerprint_source
+        else None
+    )
+
+    was_rate_limited = bool(metrics.rate_limit_scope or response_status == 429)
+    if was_rate_limited:
+        outcome = "RateLimited"
+    elif error_type == "CancelledError":
+        outcome = "Cancelled"
+        if response_status == 500:
+            response_status = 499
+    elif error_type or response_status >= 500:
+        outcome = "ServerError"
+    elif mcp_error_type:
+        outcome = "ToolError"
+    elif response_status >= 400:
+        outcome = "ClientError"
+    else:
+        outcome = "Success"
+
+    _fetch_all(
+        """
+        EXEC invest.RecordApiTokenUsage
+            @ApiTokenId = ?,
+            @UserId = ?,
+            @RequestStartedAt = ?,
+            @RequestCompletedAt = ?,
+            @DurationMs = ?,
+            @HttpMethod = ?,
+            @RequestPath = ?,
+            @HostName = ?,
+            @RpcMethod = ?,
+            @ToolName = ?,
+            @HttpStatus = ?,
+            @Outcome = ?,
+            @ErrorType = ?,
+            @WasRateLimited = ?,
+            @RateLimitScope = ?,
+            @RequestBytes = ?,
+            @ResponseBytes = ?,
+            @SchwabUnits = ?,
+            @SchwabUpstreamRequests = ?,
+            @SchwabCacheHits = ?,
+            @ClientIpAddress = ?,
+            @ClientNetwork = ?,
+            @ClientCountry = ?,
+            @ClientFingerprintHash = ?,
+            @UserAgent = ?,
+            @CfRayId = ?,
+            @McpSessionIdHash = ?;
+        """,
+        (
+            identity.api_token_id,
+            identity.user_id,
+            started_at,
+            completed_at,
+            duration_ms,
+            _limited_text(scope.get("method"), 10) or "POST",
+            _limited_text(scope.get("path"), 512) or "/mcp",
+            _limited_text(_scope_header(scope, "host"), 255),
+            rpc_method,
+            tool_name,
+            max(100, min(int(response_status), 599)),
+            outcome,
+            _limited_text(error_type or mcp_error_type, 100),
+            was_rate_limited,
+            _limited_text(metrics.rate_limit_scope, 100),
+            max(0, int(request_bytes)),
+            max(0, int(response_bytes)),
+            max(0, int(metrics.schwab_units)),
+            max(0, int(metrics.schwab_upstream_requests)),
+            max(0, int(metrics.schwab_cache_hits)),
+            client_ip,
+            client_network,
+            client_country,
+            fingerprint_hash,
+            user_agent,
+            cf_ray_id,
+            session_hash,
+        ),
+    )
+
+
 class SchwabApiError(RuntimeError):
     """A safe, token-free description of a Schwab API failure."""
+
+
+def _limit_message(scope: str, retry_after_seconds: int) -> str:
+    """Return a safe explanation suitable for an MCP client to show a user."""
+    descriptions = {
+        "mcp_token_minute": (
+            "This API token has reached its per-minute request limit."
+        ),
+        "mcp_user_minute": (
+            "Your account has reached its combined per-minute request limit."
+        ),
+        "token_concurrency": (
+            "This API token has too many requests running at the same time."
+        ),
+        "user_concurrency": (
+            "Your account has too many requests running at the same time."
+        ),
+        "schwab_user_units_minute": (
+            "Your Schwab market-data unit limit has been reached."
+        ),
+        "schwab_user_burst": (
+            "Your Schwab market-data burst limit has been reached."
+        ),
+        "schwab_user_daily": (
+            "Your daily Schwab market-data allowance has been reached."
+        ),
+        "schwab_history_user_minute": (
+            "Your Schwab price-history request limit has been reached."
+        ),
+        "schwab_history_user_daily": (
+            "Your daily Schwab price-history allowance has been reached."
+        ),
+        "schwab_global_minute": (
+            "The shared Schwab market-data service is temporarily busy."
+        ),
+        "schwab_global_concurrency": (
+            "The shared Schwab market-data service is temporarily busy."
+        ),
+    }
+    retry_after = max(1, int(retry_after_seconds))
+    seconds_label = "second" if retry_after == 1 else "seconds"
+    description = descriptions.get(
+        scope,
+        "The requested operation has reached a usage limit.",
+    )
+    return f"{description} Retry in {retry_after} {seconds_label}."
+
+
+class RateLimitExceeded(RuntimeError):
+    """Structured, token-free MCP error returned when a quota is exhausted."""
+
+    def __init__(
+        self,
+        scope: str,
+        retry_after_seconds: int,
+        *,
+        limit: int,
+        unit: str,
+    ) -> None:
+        self.scope = scope
+        self.retry_after_seconds = max(1, int(retry_after_seconds))
+        self.limit = limit
+        self.unit = unit
+        details = {
+            "error": "rate_limit_exceeded",
+            "message": _limit_message(scope, self.retry_after_seconds),
+            "scope": scope,
+            "retry_after_seconds": self.retry_after_seconds,
+            "limit": limit,
+            "unit": unit,
+        }
+        super().__init__(json.dumps(details, separators=(",", ":")))
+
+
+class _TokenBucketLimiter:
+    def __init__(self, rate_per_minute: int, capacity: int) -> None:
+        self.rate_per_minute = max(1, int(rate_per_minute))
+        self.capacity = max(1, int(capacity))
+        self._lock = threading.Lock()
+        self._buckets: dict[str, tuple[float, float]] = {}
+
+    def consume(self, key: str, amount: int = 1) -> int | None:
+        requested = max(1, int(amount))
+        if requested > self.capacity:
+            return 60
+        now = monotonic()
+        refill_per_second = self.rate_per_minute / 60.0
+        with self._lock:
+            tokens, last_refill = self._buckets.get(
+                key,
+                (float(self.capacity), now),
+            )
+            tokens = min(
+                float(self.capacity),
+                tokens + max(0.0, now - last_refill) * refill_per_second,
+            )
+            if tokens >= requested:
+                self._buckets[key] = (tokens - requested, now)
+                return None
+            self._buckets[key] = (tokens, now)
+            missing = requested - tokens
+            return max(1, int((missing / refill_per_second) + 0.999))
+
+    def refund(self, key: str, amount: int = 1) -> None:
+        now = monotonic()
+        with self._lock:
+            tokens, last_refill = self._buckets.get(key, (0.0, now))
+            refill = max(0.0, now - last_refill) * self.rate_per_minute / 60.0
+            self._buckets[key] = (
+                min(float(self.capacity), tokens + refill + max(1, int(amount))),
+                now,
+            )
+
+    def clear(self) -> None:
+        with self._lock:
+            self._buckets.clear()
+
+
+class _UtcDailyCounter:
+    def __init__(self, limit: int) -> None:
+        self.limit = max(1, int(limit))
+        self._lock = threading.Lock()
+        self._usage: dict[tuple[str, date], int] = {}
+
+    def consume(self, key: str, amount: int = 1) -> int | None:
+        requested = max(1, int(amount))
+        now = datetime.now(timezone.utc)
+        today = now.date()
+        counter_key = (key, today)
+        with self._lock:
+            used = self._usage.get(counter_key, 0)
+            if used + requested <= self.limit:
+                self._usage[counter_key] = used + requested
+                if len(self._usage) > 10_000:
+                    self._usage = {
+                        item_key: value
+                        for item_key, value in self._usage.items()
+                        if item_key[1] >= today - timedelta(days=1)
+                    }
+                return None
+        tomorrow = datetime.combine(
+            today + timedelta(days=1),
+            datetime_time.min,
+            tzinfo=timezone.utc,
+        )
+        return max(1, int((tomorrow - now).total_seconds() + 0.999))
+
+    def refund(self, key: str, amount: int = 1) -> None:
+        counter_key = (key, datetime.now(timezone.utc).date())
+        with self._lock:
+            used = self._usage.get(counter_key, 0)
+            self._usage[counter_key] = max(0, used - max(1, int(amount)))
+
+    def clear(self) -> None:
+        with self._lock:
+            self._usage.clear()
+
+
+_MCP_TOKEN_LIMITER = _TokenBucketLimiter(
+    MCP_TOKEN_RATE_PER_MINUTE,
+    MCP_TOKEN_BURST,
+)
+_MCP_USER_LIMITER = _TokenBucketLimiter(MCP_USER_RATE_PER_MINUTE, MCP_USER_BURST)
+_SCHWAB_USER_UNIT_LIMITER = _TokenBucketLimiter(
+    SCHWAB_USER_UNITS_PER_MINUTE,
+    SCHWAB_USER_UNITS_PER_MINUTE,
+)
+_SCHWAB_USER_REQUEST_LIMITER = _TokenBucketLimiter(
+    SCHWAB_USER_UNITS_PER_MINUTE,
+    SCHWAB_USER_REQUEST_BURST,
+)
+_SCHWAB_USER_DAILY_COUNTER = _UtcDailyCounter(SCHWAB_USER_DAILY_UNITS)
+_SCHWAB_HISTORY_LIMITER = _TokenBucketLimiter(
+    SCHWAB_HISTORY_CALLS_PER_MINUTE,
+    SCHWAB_HISTORY_BURST,
+)
+_SCHWAB_HISTORY_DAILY_COUNTER = _UtcDailyCounter(SCHWAB_HISTORY_DAILY_CALLS)
+_SCHWAB_GLOBAL_LIMITER = _TokenBucketLimiter(
+    SCHWAB_GLOBAL_REQUESTS_PER_MINUTE,
+    SCHWAB_GLOBAL_BURST,
+)
+_SCHWAB_CONCURRENCY = threading.BoundedSemaphore(
+    max(1, SCHWAB_MAX_CONCURRENT_REQUESTS)
+)
+
+
+def _raise_rate_limit(
+    scope: str,
+    retry_after_seconds: int,
+    *,
+    limit: int,
+    unit: str,
+    user_id: str | None = None,
+) -> None:
+    request_metrics = _REQUEST_USAGE_METRICS.get()
+    if request_metrics is not None:
+        request_metrics.rate_limit_scope = scope
+    LOGGER.warning(
+        "Rate limit exceeded: scope=%s user_id=%s retry_after_seconds=%s "
+        "limit=%s unit=%s",
+        scope,
+        user_id or "shared",
+        retry_after_seconds,
+        limit,
+        unit,
+    )
+    raise RateLimitExceeded(
+        scope,
+        retry_after_seconds,
+        limit=limit,
+        unit=unit,
+    )
+
+
+def _enforce_general_mcp_limit(
+    user_id: str,
+    token_key: str | None = None,
+) -> None:
+    if token_key:
+        retry_after = _MCP_TOKEN_LIMITER.consume(token_key)
+        if retry_after is not None:
+            _raise_rate_limit(
+                "mcp_token_minute",
+                retry_after,
+                limit=MCP_TOKEN_RATE_PER_MINUTE,
+                unit="calls_per_minute",
+                user_id=user_id,
+            )
+
+    retry_after = _MCP_USER_LIMITER.consume(user_id)
+    if retry_after is not None:
+        if token_key:
+            _MCP_TOKEN_LIMITER.refund(token_key)
+        _raise_rate_limit(
+            "mcp_user_minute",
+            retry_after,
+            limit=MCP_USER_RATE_PER_MINUTE,
+            unit="calls_per_minute",
+            user_id=user_id,
+        )
+
+
+def _reserve_schwab_user_capacity(
+    user_id: str,
+    units: int,
+    *,
+    is_history: bool,
+) -> None:
+    reservations: list[tuple[Any, str, int]] = []
+
+    def reserve(
+        limiter: _TokenBucketLimiter | _UtcDailyCounter,
+        key: str,
+        amount: int,
+        scope: str,
+        limit: int,
+        unit: str,
+    ) -> None:
+        retry_after = limiter.consume(key, amount)
+        if retry_after is not None:
+            for reserved_limiter, reserved_key, reserved_amount in reversed(
+                reservations
+            ):
+                reserved_limiter.refund(reserved_key, reserved_amount)
+            _raise_rate_limit(
+                scope,
+                retry_after,
+                limit=limit,
+                unit=unit,
+                user_id=user_id,
+            )
+        reservations.append((limiter, key, amount))
+
+    reserve(
+        _SCHWAB_USER_UNIT_LIMITER,
+        user_id,
+        units,
+        "schwab_user_units_minute",
+        SCHWAB_USER_UNITS_PER_MINUTE,
+        "units_per_minute",
+    )
+    reserve(
+        _SCHWAB_USER_REQUEST_LIMITER,
+        user_id,
+        1,
+        "schwab_user_burst",
+        SCHWAB_USER_REQUEST_BURST,
+        "requests_burst",
+    )
+    reserve(
+        _SCHWAB_USER_DAILY_COUNTER,
+        user_id,
+        units,
+        "schwab_user_daily",
+        SCHWAB_USER_DAILY_UNITS,
+        "units_per_utc_day",
+    )
+    if is_history:
+        reserve(
+            _SCHWAB_HISTORY_LIMITER,
+            user_id,
+            1,
+            "schwab_history_user_minute",
+            SCHWAB_HISTORY_CALLS_PER_MINUTE,
+            "calls_per_minute",
+        )
+        reserve(
+            _SCHWAB_HISTORY_DAILY_COUNTER,
+            user_id,
+            1,
+            "schwab_history_user_daily",
+            SCHWAB_HISTORY_DAILY_CALLS,
+            "calls_per_utc_day",
+        )
+
+
+@contextmanager
+def _schwab_global_request_slot():
+    retry_after = _SCHWAB_GLOBAL_LIMITER.consume("global")
+    if retry_after is not None:
+        _raise_rate_limit(
+            "schwab_global_minute",
+            retry_after,
+            limit=SCHWAB_GLOBAL_REQUESTS_PER_MINUTE,
+            unit="requests_per_minute",
+        )
+
+    acquired = _SCHWAB_CONCURRENCY.acquire(timeout=1)
+    if not acquired:
+        _SCHWAB_GLOBAL_LIMITER.refund("global")
+        _raise_rate_limit(
+            "schwab_global_concurrency",
+            1,
+            limit=SCHWAB_MAX_CONCURRENT_REQUESTS,
+            unit="concurrent_requests",
+        )
+    try:
+        yield
+    finally:
+        _SCHWAB_CONCURRENCY.release()
 
 
 def _as_utc_datetime(value: Any) -> datetime | None:
@@ -670,8 +1537,15 @@ def _schwab_market_data_get(
             method="GET",
         )
         try:
-            with urlopen(request, timeout=SCHWAB_HTTP_TIMEOUT_SECONDS) as response:
-                payload_bytes = response.read(10_485_761)
+            with _schwab_global_request_slot():
+                request_metrics = _REQUEST_USAGE_METRICS.get()
+                if request_metrics is not None:
+                    request_metrics.schwab_upstream_requests += 1
+                with urlopen(
+                    request,
+                    timeout=SCHWAB_HTTP_TIMEOUT_SECONDS,
+                ) as response:
+                    payload_bytes = response.read(10_485_761)
         except HTTPError as exc:
             if exc.code == 401 and attempt == 0:
                 continue
@@ -700,6 +1574,9 @@ def _schwab_cached_market_data_get(
     params: dict[str, Any] | None = None,
     *,
     ttl_seconds: int,
+    user_id: str,
+    units: int = 1,
+    is_history: bool = False,
 ) -> Any:
     cache_key = json.dumps(
         {"path": path, "params": params or {}},
@@ -711,8 +1588,15 @@ def _schwab_cached_market_data_get(
     with _SCHWAB_RESPONSE_CACHE_LOCK:
         cached = _SCHWAB_RESPONSE_CACHE.get(cache_key)
         if cached and cached[0] > now:
+            request_metrics = _REQUEST_USAGE_METRICS.get()
+            if request_metrics is not None:
+                request_metrics.schwab_cache_hits += 1
             return deepcopy(cached[1])
 
+    _reserve_schwab_user_capacity(user_id, units, is_history=is_history)
+    request_metrics = _REQUEST_USAGE_METRICS.get()
+    if request_metrics is not None:
+        request_metrics.schwab_units += max(1, int(units))
     payload = _schwab_market_data_get(path, params)
     with _SCHWAB_RESPONSE_CACHE_LOCK:
         if len(_SCHWAB_RESPONSE_CACHE) >= 1000:
@@ -927,6 +1811,16 @@ def _request_authentication_subject(ctx: Context) -> str:
 
 
 def _current_user_id(ctx: Context) -> str:
+    request_context = getattr(ctx, "request_context", None)
+    request = getattr(request_context, "request", None)
+    if request is not None:
+        state = request.scope.get("state", {})
+        authenticated_user_id = str(state.get("user_id", "")).strip()
+        if authenticated_user_id:
+            token_rate_key = str(state.get("token_rate_key", "")).strip() or None
+            _enforce_general_mcp_limit(authenticated_user_id, token_rate_key)
+            return authenticated_user_id
+
     subject = _request_authentication_subject(ctx)
     row = _fetch_one(
         """
@@ -939,7 +1833,9 @@ def _current_user_id(ctx: Context) -> str:
     )
     if not row:
         raise PermissionError("Authenticated user identity is not active.")
-    return str(row["UserId"])
+    user_id = str(row["UserId"])
+    _enforce_general_mcp_limit(user_id)
+    return user_id
 
 
 def _require_owned_account(
@@ -1181,12 +2077,14 @@ def _load_research_rows(
 
 @mcp.tool(annotations=OPEN_WORLD_READ_ONLY_TOOL)
 def search_symbols(
+    ctx: Context,
     query: str = "",
     asset_type: str | None = None,
     active_only: bool = True,
     limit: int = 25,
 ) -> list[dict[str, Any]]:
     """Search local instruments, then Schwab for symbols not in the database."""
+    user_id = _current_user_id(ctx)
     limit = _clamp_limit(limit, default=25)
     cleaned_query = query.strip()
     if len(cleaned_query) > 100 or any(ord(char) < 32 for char in cleaned_query):
@@ -1196,13 +2094,13 @@ def search_symbols(
 
     if cleaned_query:
         pattern = f"%{cleaned_query}%"
-        filters.append("(Symbol LIKE ? OR ISymbol LIKE ? OR Name LIKE ?)")
-        params.extend([pattern, pattern, pattern])
+        filters.append("(Symbol LIKE ? OR Name LIKE ?)")
+        params.extend([pattern, pattern])
     if asset_type:
         filters.append("AssetType = ?")
         params.append(asset_type)
-    if active_only:
-        filters.append("Active = 1")
+    # invest.McpInstruments already exposes active instruments only. Keep the
+    # parameter for backward-compatible tool schemas.
 
     where = f"WHERE {' AND '.join(filters)}" if filters else ""
     local_rows = _fetch_all(
@@ -1210,17 +2108,8 @@ def search_symbols(
         SELECT TOP ({limit})
             SeriesId,
             Symbol,
-            ISymbol,
             Name,
             Type,
-            Active,
-            StatusId,
-            IsWatched,
-            IsTraded,
-            TradePrice,
-            TradeDate,
-            MaxDataDate,
-            MinDataDate,
             PE,
             Volatility,
             Yield,
@@ -1229,7 +2118,7 @@ def search_symbols(
             Exchange,
             AssetType,
             AssetSubType
-        FROM dbo.Series
+        FROM invest.McpInstruments
         {where}
         ORDER BY Symbol;
         """,
@@ -1245,6 +2134,8 @@ def search_symbols(
             "/instruments",
             {"symbol": cleaned_query, "projection": "symbol-search"},
             ttl_seconds=3600,
+            user_id=user_id,
+            units=1,
         )
         external_rows = _schwab_instrument_rows(payload)
     except SchwabApiError:
@@ -1268,8 +2159,9 @@ def search_symbols(
 
 
 @mcp.tool(annotations=OPEN_WORLD_READ_ONLY_TOOL)
-def get_symbol_profile(symbol: str) -> dict[str, Any] | None:
+def get_symbol_profile(ctx: Context, symbol: str) -> dict[str, Any] | None:
     """Return Schwab profile/fundamentals, merged with local data when present."""
+    user_id = _current_user_id(ctx)
     cleaned = _clean_symbol(symbol)
     rows = _fetch_all(
         """
@@ -1277,42 +2169,19 @@ def get_symbol_profile(symbol: str) -> dict[str, Any] | None:
             SeriesId,
             Name,
             Symbol,
-            ISymbol,
             Type,
-            Intraday,
-            Active,
-            MaxDataDate,
-            MinDataDate,
-            StatusId,
-            IsTraded,
-            IsWatched,
-            Created,
-            Updated,
-            TradePrice,
-            TradeDate,
-            Quantity,
             PE,
             Volatility,
             Yield,
-            _52WkHigh,
-            _52WkLow,
-            Description,
-            Calculated,
-            SectorId,
-            IndustryId,
-            NextEarningsDate,
-            Rank,
-            IsStopLimitOn,
             EPS,
             DivAmount,
             Exchange,
             AssetType,
             AssetSubType
-        FROM dbo.Series
-        WHERE UPPER(Symbol) = ? OR UPPER(ISymbol) = ?
-        ORDER BY Active DESC, Symbol;
+        FROM invest.McpInstruments
+        WHERE UPPER(Symbol) = ?;
         """,
-        (cleaned, cleaned),
+        (cleaned,),
     )
     local = rows[0] if rows else None
     try:
@@ -1320,6 +2189,8 @@ def get_symbol_profile(symbol: str) -> dict[str, Any] | None:
             "/instruments",
             {"symbol": cleaned, "projection": "fundamental"},
             ttl_seconds=3600,
+            user_id=user_id,
+            units=1,
         )
         external_rows = _schwab_instrument_rows(payload)
     except SchwabApiError:
@@ -1346,9 +2217,15 @@ def get_symbol_profile(symbol: str) -> dict[str, Any] | None:
 
 
 @mcp.tool(annotations=OPEN_WORLD_READ_ONLY_TOOL)
-def get_latest_prices(symbols: list[str]) -> list[dict[str, Any]]:
+def get_latest_prices(ctx: Context, symbols: list[str]) -> list[dict[str, Any]]:
     """Return current Schwab quotes for any symbols, with SQL fallback."""
+    user_id = _current_user_id(ctx)
     cleaned = _clean_symbols(symbols)
+    if len(cleaned) > SCHWAB_MAX_QUOTE_SYMBOLS:
+        raise ValueError(
+            f"A quote request may contain at most {SCHWAB_MAX_QUOTE_SYMBOLS} "
+            "unique symbols."
+        )
     quote_by_symbol: dict[str, dict[str, Any]] = {}
     schwab_error: SchwabApiError | None = None
     try:
@@ -1363,6 +2240,8 @@ def get_latest_prices(symbols: list[str]) -> list[dict[str, Any]]:
                     "indicative": "false",
                 },
                 ttl_seconds=15,
+                user_id=user_id,
+                units=max(1, (len(batch) + 49) // 50),
             )
             for row in _schwab_quote_rows(payload, batch):
                 quote_by_symbol[str(row["Symbol"]).upper()] = row
@@ -1376,21 +2255,28 @@ def get_latest_prices(symbols: list[str]) -> list[dict[str, Any]]:
         local_rows = _fetch_all(
             f"""
             SELECT
-                Symbol,
-                ISymbol,
-                Name,
-                TradePrice,
-                TradeDate,
-                MaxDataDate,
-                Updated,
-                AssetType,
-                AssetSubType,
-                Exchange
-            FROM dbo.Series
-            WHERE UPPER(Symbol) IN ({placeholders})
-               OR UPPER(ISymbol) IN ({placeholders});
+                i.Symbol,
+                i.Name,
+                latest.LastValue AS LastPrice,
+                latest.PriceDate,
+                latest.Updated,
+                i.AssetType,
+                i.AssetSubType,
+                i.Exchange
+            FROM invest.McpInstruments i
+            OUTER APPLY
+            (
+                SELECT TOP (1)
+                    sd.LastValue,
+                    sd.Date AS PriceDate,
+                    sd.Updated
+                FROM dbo.SeriesData sd
+                WHERE sd.SeriesId = i.SeriesId
+                ORDER BY sd.Date DESC
+            ) latest
+            WHERE UPPER(i.Symbol) IN ({placeholders});
             """,
-            tuple(missing + missing),
+            tuple(missing),
         )
         for row in local_rows:
             normalized = {
@@ -1400,17 +2286,14 @@ def get_latest_prices(symbols: list[str]) -> list[dict[str, Any]]:
                 "AssetSubType": row.get("AssetSubType"),
                 "Exchange": row.get("Exchange"),
                 "Realtime": False,
-                "LastPrice": row.get("TradePrice"),
-                "PriceDate": row.get("TradeDate") or row.get("MaxDataDate"),
+                "LastPrice": row.get("LastPrice"),
+                "PriceDate": row.get("PriceDate"),
                 "Updated": row.get("Updated"),
                 "Source": "SQL",
             }
-            for symbol_key in {
-                str(row.get("Symbol") or "").upper(),
-                str(row.get("ISymbol") or "").upper(),
-            }:
-                if symbol_key:
-                    quote_by_symbol[symbol_key] = normalized
+            symbol_key = str(row.get("Symbol") or "").upper()
+            if symbol_key:
+                quote_by_symbol[symbol_key] = normalized
 
     if schwab_error and not quote_by_symbol:
         raise schwab_error
@@ -1419,12 +2302,14 @@ def get_latest_prices(symbols: list[str]) -> list[dict[str, Any]]:
 
 @mcp.tool(annotations=OPEN_WORLD_READ_ONLY_TOOL)
 def get_price_history(
+    ctx: Context,
     symbol: str,
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = 2000,
 ) -> list[dict[str, Any]]:
     """Return local daily history, using Schwab when the symbol is not loaded."""
+    user_id = _current_user_id(ctx)
     cleaned = _clean_symbol(symbol)
     end_value = _parse_date(end_date, "end_date") or date.today()
     start_value = _parse_date(start_date, "start_date") or (
@@ -1448,14 +2333,14 @@ def get_price_history(
             sd.Created,
             sd.Updated
         FROM dbo.SeriesData sd
-        JOIN dbo.Series s
+        JOIN invest.McpInstruments s
             ON s.SeriesId = sd.SeriesId
-        WHERE (UPPER(s.Symbol) = ? OR UPPER(s.ISymbol) = ?)
+        WHERE UPPER(s.Symbol) = ?
           AND sd.Date >= ?
           AND sd.Date <= ?
         ORDER BY sd.Date;
         """,
-        (cleaned, cleaned, start_value, end_value),
+        (cleaned, start_value, end_value),
     )
     if local_rows:
         return [{**row, "Source": "SQL"} for row in local_rows]
@@ -1489,16 +2374,21 @@ def get_price_history(
             "needPreviousClose": "true",
         },
         ttl_seconds=900,
+        user_id=user_id,
+        units=5,
+        is_history=True,
     )
     return _schwab_history_rows(payload, cleaned, limit)
 
 
 @mcp.tool(annotations=OPEN_WORLD_READ_ONLY_TOOL)
 def get_market_hours(
+    ctx: Context,
     markets: list[str] | None = None,
     market_date: str | None = None,
 ) -> dict[str, Any]:
     """Return Schwab market hours for investment markets (options excluded)."""
+    user_id = _current_user_id(ctx)
     requested_markets = [
         str(value).strip().lower() for value in (markets or ["equity", "bond"])
     ]
@@ -1513,6 +2403,8 @@ def get_market_hours(
             "date": requested_date.isoformat(),
         },
         ttl_seconds=300,
+        user_id=user_id,
+        units=1,
     )
     return {
         "Source": "Schwab",
@@ -1523,12 +2415,14 @@ def get_market_hours(
 
 @mcp.tool(annotations=OPEN_WORLD_READ_ONLY_TOOL)
 def get_market_movers(
+    ctx: Context,
     index_symbol: str = "$SPX",
     sort: str = "PERCENT_CHANGE_UP",
     frequency: int = 10,
     limit: int = 10,
 ) -> dict[str, Any]:
     """Return Schwab movers for a supported equity market or index."""
+    user_id = _current_user_id(ctx)
     normalized_index = index_symbol.strip().upper()
     allowed_indexes = {
         "$DJI",
@@ -1568,6 +2462,8 @@ def get_market_movers(
         f"/movers/{normalized_index}",
         {"sort": normalized_sort, "frequency": normalized_frequency},
         ttl_seconds=60,
+        user_id=user_id,
+        units=1,
     )
     screeners = payload.get("screeners", []) if isinstance(payload, dict) else []
     if not isinstance(screeners, list):
@@ -1600,6 +2496,7 @@ def get_market_movers(
 
 @mcp.tool(annotations=READ_ONLY_TOOL)
 def get_research_snapshot(
+    ctx: Context,
     symbols: list[str] | None = None,
     asset_type: str | None = None,
     watched_only: bool = False,
@@ -1607,6 +2504,7 @@ def get_research_snapshot(
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     """Return research/ranking rows from the configured research stored procedure."""
+    _current_user_id(ctx)
     cleaned = _clean_symbols(symbols) if symbols else None
     return _load_research_rows(
         symbols=cleaned,
@@ -1618,14 +2516,16 @@ def get_research_snapshot(
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL)
-def compare_symbols(symbols: list[str]) -> list[dict[str, Any]]:
+def compare_symbols(ctx: Context, symbols: list[str]) -> list[dict[str, Any]]:
     """Compare selected symbols using the research stored procedure output."""
+    _current_user_id(ctx)
     cleaned = _clean_symbols(symbols)
     return _load_research_rows(symbols=cleaned, limit=len(cleaned))
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL)
 def screen_instruments(
+    ctx: Context,
     asset_type: str | None = None,
     asset_sub_type: str | None = None,
     watched_only: bool = False,
@@ -1640,6 +2540,7 @@ def screen_instruments(
     limit: int = 100,
 ) -> list[dict[str, Any]]:
     """Screen instruments using fields returned by the research stored procedure."""
+    _current_user_id(ctx)
     rows = _load_research_rows(
         asset_type=asset_type,
         watched_only=watched_only,
@@ -1680,97 +2581,73 @@ def screen_instruments(
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL)
-def get_watched_symbols(limit: int = 200) -> list[dict[str, Any]]:
-    """Return instruments marked IsWatched in dbo.Series."""
+def get_watched_symbols(ctx: Context, limit: int = 200) -> list[dict[str, Any]]:
+    """Return instruments included in the MCP watch list."""
+    _current_user_id(ctx)
     limit = _clamp_limit(limit, default=200)
-    return _fetch_all(
-        f"""
-        SELECT TOP ({limit})
-            SeriesId,
-            Symbol,
-            ISymbol,
-            Name,
-            Type,
-            Active,
-            StatusId,
-            IsWatched,
-            IsTraded,
-            TradePrice,
-            TradeDate,
-            MaxDataDate,
-            MinDataDate,
-            PE,
-            Volatility,
-            Yield,
-            EPS,
-            DivAmount,
-            Exchange,
-            AssetType,
-            AssetSubType
-        FROM dbo.Series
-        WHERE IsWatched = 1
-        ORDER BY Symbol;
-        """
-    )
+    return _load_research_rows(watched_only=True, limit=limit)
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL)
-def get_traded_symbols(limit: int = 200) -> list[dict[str, Any]]:
-    """Return instruments marked IsTraded in dbo.Series."""
+def get_traded_symbols(ctx: Context, limit: int = 200) -> list[dict[str, Any]]:
+    """Return instruments included in the MCP traded-symbol list."""
+    _current_user_id(ctx)
     limit = _clamp_limit(limit, default=200)
-    return _fetch_all(
-        f"""
-        SELECT TOP ({limit})
-            SeriesId,
-            Symbol,
-            ISymbol,
-            Name,
-            Type,
-            Active,
-            StatusId,
-            IsWatched,
-            IsTraded,
-            TradePrice,
-            TradeDate,
-            MaxDataDate,
-            MinDataDate,
-            PE,
-            Volatility,
-            Yield,
-            EPS,
-            DivAmount,
-            Exchange,
-            AssetType,
-            AssetSubType
-        FROM dbo.Series
-        WHERE IsTraded = 1
-        ORDER BY Symbol;
-        """
-    )
+    return _load_research_rows(traded_only=True, limit=limit)
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL)
-def get_data_freshness() -> dict[str, Any]:
+def get_data_freshness(ctx: Context) -> dict[str, Any]:
     """Summarize instrument counts and latest available data dates."""
+    _current_user_id(ctx)
     summary = _fetch_all(
         """
         SELECT
             COUNT(*) AS InstrumentCount,
-            SUM(CASE WHEN Active = 1 THEN 1 ELSE 0 END) AS ActiveInstrumentCount,
-            SUM(CASE WHEN IsWatched = 1 THEN 1 ELSE 0 END) AS WatchedInstrumentCount,
-            SUM(CASE WHEN IsTraded = 1 THEN 1 ELSE 0 END) AS TradedInstrumentCount,
-            MIN(MinDataDate) AS EarliestDataDate,
-            MAX(MaxDataDate) AS LatestDataDate,
-            MAX(Updated) AS LatestSeriesUpdate
-        FROM dbo.Series;
+            MIN(first_price.FirstDataDate) AS EarliestDataDate,
+            MAX(latest_price.MaxDataDate) AS LatestDataDate,
+            MAX(latest_price.Updated) AS LatestSeriesUpdate
+        FROM invest.McpInstruments i
+        OUTER APPLY
+        (
+            SELECT TOP (1)
+                sd.Date AS FirstDataDate
+            FROM dbo.SeriesData sd
+            WHERE sd.SeriesId = i.SeriesId
+            ORDER BY sd.Date
+        ) first_price
+        OUTER APPLY
+        (
+            SELECT TOP (1)
+                sd.Date AS MaxDataDate,
+                COALESCE(sd.Updated, sd.Created) AS Updated
+            FROM dbo.SeriesData sd
+            WHERE sd.SeriesId = i.SeriesId
+            ORDER BY sd.Date DESC
+        ) latest_price;
         """
     )
     date_buckets = _fetch_all(
         """
+        WITH LatestInstrumentDates AS
+        (
+            SELECT
+                i.SeriesId,
+                latest_price.MaxDataDate
+            FROM invest.McpInstruments i
+            OUTER APPLY
+            (
+                SELECT TOP (1)
+                    sd.Date AS MaxDataDate
+                FROM dbo.SeriesData sd
+                WHERE sd.SeriesId = i.SeriesId
+                ORDER BY sd.Date DESC
+            ) latest_price
+        )
         SELECT TOP (10)
             CAST(MaxDataDate AS date) AS DataDate,
             COUNT(*) AS InstrumentCount
-        FROM dbo.Series
+        FROM LatestInstrumentDates
         WHERE MaxDataDate IS NOT NULL
         GROUP BY CAST(MaxDataDate AS date)
         ORDER BY DataDate DESC;
@@ -1783,8 +2660,9 @@ def get_data_freshness() -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL)
-def get_market_indicators(limit: int = 100) -> list[dict[str, Any]]:
+def get_market_indicators(ctx: Context, limit: int = 100) -> list[dict[str, Any]]:
     """Return the highest-ranked current market research indicators."""
+    _current_user_id(ctx)
     rows = _load_research_rows(limit=_clamp_limit(limit))
     return sorted(
         rows,
@@ -3106,10 +3984,11 @@ def schema() -> str:
     return """
 This MCP server uses these SQL Server objects:
 
-dbo.Series:
-  Instrument master data: SeriesId, Symbol, ISymbol, Name, Type, Active,
-  MaxDataDate, MinDataDate, IsWatched, IsTraded, TradePrice, TradeDate,
-  PE, Volatility, Yield, EPS, DivAmount, Exchange, AssetType, AssetSubType.
+invest.McpInstruments:
+  Least-privilege active-instrument catalog filtered to exclude internal TEMP
+  and PORTF calculation series. It exposes identifiers, names, core
+  fundamentals, exchange, and asset classification only. The MCP runtime has
+  no direct SELECT permission on dbo.Series.
 
 dbo.SeriesData:
   Daily history: SeriesDataId, SeriesId, Date, OpenValue, HighValue,

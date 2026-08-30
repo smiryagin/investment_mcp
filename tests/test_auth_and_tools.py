@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import struct
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import call, patch
 from urllib.error import HTTPError
 from urllib.parse import parse_qs
@@ -63,6 +65,10 @@ class BearerAuthenticationTests(unittest.TestCase):
             observed_scope["state"]["authentication_subject"],
             "auth0|son",
         )
+        self.assertEqual(
+            observed_scope["state"]["token_rate_key"],
+            hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        )
 
     def test_invalid_token_returns_401(self) -> None:
         messages: list[dict[str, object]] = []
@@ -91,11 +97,18 @@ class BearerAuthenticationTests(unittest.TestCase):
         with patch.object(
             server,
             "_fetch_one",
-            return_value={"AuthenticationSubject": "local:andreySr"},
+            return_value={
+                "ApiTokenId": "token-id",
+                "UserId": "user-id",
+                "AuthenticationSubject": "local:andreySr",
+            },
         ) as fetch_one:
-            subject = server._resolve_database_token(token)
+            identity = server._resolve_database_token(token)
 
-        self.assertEqual(subject, "local:andreySr")
+        self.assertEqual(identity.authentication_subject, "local:andreySr")
+        self.assertEqual(identity.api_token_id, "token-id")
+        self.assertEqual(identity.user_id, "user-id")
+        self.assertEqual(identity.token_key, "token-id")
         self.assertEqual(
             fetch_one.call_args.args[1],
             (hashlib.sha256(token.encode("utf-8")).digest(),),
@@ -114,7 +127,10 @@ class BearerAuthenticationTests(unittest.TestCase):
             clear=False,
         ), patch.object(server, "_resolve_database_token", return_value=None):
             resolver = server._build_token_resolver()
-            self.assertEqual(resolver(token), "local:andreySr")
+            identity = resolver(token)
+            self.assertEqual(identity.authentication_subject, "local:andreySr")
+            self.assertIsNone(identity.api_token_id)
+            self.assertIsNone(identity.user_id)
 
     def test_database_mode_does_not_accept_legacy_token(self) -> None:
         token = "temporary-legacy-token"
@@ -131,8 +147,214 @@ class BearerAuthenticationTests(unittest.TestCase):
             resolver = server._build_token_resolver()
             self.assertIsNone(resolver(token))
 
+    def test_token_concurrency_limit_returns_429_and_releases_slot(self) -> None:
+        async def scenario() -> None:
+            started = asyncio.Event()
+            finish = asyncio.Event()
+            token_limiter = server._KeyedConcurrencyLimiter(1)
+            user_limiter = server._KeyedConcurrencyLimiter(2)
+
+            async def app(scope, receive, send):
+                started.set()
+                await finish.wait()
+
+            identity = server.AuthIdentity(
+                authentication_subject="local:user",
+                user_id="user-id",
+                api_token_id="token-id",
+                token_key="token-id",
+            )
+            middleware = server.BearerAuthASGI(
+                app,
+                lambda token: identity,
+                "/mcp",
+                token_concurrency_limiter=token_limiter,
+                user_concurrency_limiter=user_limiter,
+            )
+            scope = {
+                "type": "http",
+                "method": "POST",
+                "path": "/mcp",
+                "headers": [(b"authorization", b"Bearer token")],
+            }
+
+            async def receive():
+                return {"type": "http.request"}
+
+            async def discard_send(message):
+                return None
+
+            first = asyncio.create_task(
+                middleware(scope, receive, discard_send)
+            )
+            await started.wait()
+            messages: list[dict[str, object]] = []
+
+            async def capture_send(message):
+                messages.append(message)
+
+            await middleware(scope, receive, capture_send)
+            self.assertEqual(messages[0]["status"], 429)
+            self.assertIn(b"token_concurrency", messages[1]["body"])
+            self.assertIn(
+                b"This API token has too many requests running",
+                messages[1]["body"],
+            )
+            self.assertEqual(token_limiter.active("token-id"), 1)
+
+            finish.set()
+            await first
+            self.assertEqual(token_limiter.active("token-id"), 0)
+            self.assertEqual(user_limiter.active("user-id"), 0)
+
+        with patch.object(server, "MCP_TOKEN_USAGE_LOG_ENABLED", False):
+            asyncio.run(scenario())
+
+    def test_user_concurrency_aggregates_different_tokens(self) -> None:
+        async def scenario() -> None:
+            started = asyncio.Event()
+            finish = asyncio.Event()
+            token_limiter = server._KeyedConcurrencyLimiter(1)
+            user_limiter = server._KeyedConcurrencyLimiter(1)
+
+            async def app(scope, receive, send):
+                started.set()
+                await finish.wait()
+
+            identities = {
+                "one": server.AuthIdentity(
+                    "local:user", "user-id", "token-one", "token-one"
+                ),
+                "two": server.AuthIdentity(
+                    "local:user", "user-id", "token-two", "token-two"
+                ),
+            }
+            middleware = server.BearerAuthASGI(
+                app,
+                lambda token: identities.get(token),
+                "/mcp",
+                token_concurrency_limiter=token_limiter,
+                user_concurrency_limiter=user_limiter,
+            )
+
+            def request_scope(token: str) -> dict[str, object]:
+                return {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/mcp",
+                    "headers": [
+                        (b"authorization", f"Bearer {token}".encode("latin1"))
+                    ],
+                }
+
+            async def receive():
+                return {"type": "http.request"}
+
+            async def discard_send(message):
+                return None
+
+            first = asyncio.create_task(
+                middleware(request_scope("one"), receive, discard_send)
+            )
+            await started.wait()
+            messages: list[dict[str, object]] = []
+
+            async def capture_send(message):
+                messages.append(message)
+
+            await middleware(request_scope("two"), receive, capture_send)
+            self.assertEqual(messages[0]["status"], 429)
+            self.assertIn(b"user_concurrency", messages[1]["body"])
+            self.assertIn(
+                b"Your account has too many requests running",
+                messages[1]["body"],
+            )
+            self.assertEqual(token_limiter.active("token-two"), 0)
+
+            finish.set()
+            await first
+            self.assertEqual(user_limiter.active("user-id"), 0)
+
+        with patch.object(server, "MCP_TOKEN_USAGE_LOG_ENABLED", False):
+            asyncio.run(scenario())
+
+    def test_authenticated_post_records_request_and_response_metadata(self) -> None:
+        request_body = b'{"method":"tools/call","params":{"name":"test_tool"}}'
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "http.response.start", "status": 200})
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b'{"result":{"isError":false}}',
+                }
+            )
+
+        identity = server.AuthIdentity(
+            "local:user",
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+            "token-key",
+        )
+        middleware = server.BearerAuthASGI(
+            app,
+            lambda token: identity,
+            "/mcp",
+            token_concurrency_limiter=server._KeyedConcurrencyLimiter(2),
+            user_concurrency_limiter=server._KeyedConcurrencyLimiter(4),
+        )
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/mcp",
+            "headers": [(b"authorization", b"Bearer token")],
+        }
+
+        async def receive():
+            return {
+                "type": "http.request",
+                "body": request_body,
+                "more_body": False,
+            }
+
+        async def send(message):
+            return None
+
+        with patch.object(
+            server,
+            "_record_api_token_usage",
+        ) as record_usage, patch.object(
+            server,
+            "MCP_TOKEN_USAGE_LOG_ENABLED",
+            True,
+        ):
+            asyncio.run(middleware(scope, receive, send))
+
+        record_usage.assert_called_once()
+        kwargs = record_usage.call_args.kwargs
+        self.assertEqual(kwargs["captured_body"], request_body)
+        self.assertEqual(kwargs["response_status"], 200)
+        self.assertGreater(kwargs["response_bytes"], 0)
+
 
 class ToolSchemaTests(unittest.TestCase):
+    def test_context_is_not_exposed_in_public_tool_schemas(self) -> None:
+        registered = server.mcp._tool_manager._tools
+        for name in {
+            "search_symbols",
+            "get_symbol_profile",
+            "get_latest_prices",
+            "get_price_history",
+            "get_market_hours",
+            "get_market_movers",
+            "get_research_snapshot",
+            "compare_symbols",
+            "screen_instruments",
+        }:
+            properties = registered[name].parameters.get("properties", {})
+            self.assertNotIn("ctx", properties, name)
+
     def test_private_tool_schemas_do_not_accept_user_id(self) -> None:
         private_tools = {
             "create_account",
@@ -541,8 +763,10 @@ class SchwabMarketDataToolTests(unittest.TestCase):
             server,
             "_schwab_cached_market_data_get",
             return_value=payload,
-        ), patch.object(server, "_fetch_all") as fetch_all:
-            rows = server.get_latest_prices(["voo"])
+        ), patch.object(server, "_current_user_id", return_value="user-1"), patch.object(
+            server, "_fetch_all"
+        ) as fetch_all:
+            rows = server.get_latest_prices(None, ["voo"])
 
         fetch_all.assert_not_called()
         self.assertEqual(rows[0]["Symbol"], "VOO")
@@ -560,12 +784,14 @@ class SchwabMarketDataToolTests(unittest.TestCase):
                 }
             ]
         }
-        with patch.object(server, "_fetch_all", return_value=[]), patch.object(
+        with patch.object(server, "_current_user_id", return_value="user-1"), patch.object(
+            server, "_fetch_all", return_value=[]
+        ), patch.object(
             server,
             "_schwab_cached_market_data_get",
             return_value=payload,
         ) as schwab_get:
-            rows = server.search_symbols("SCHD")
+            rows = server.search_symbols(None, "SCHD")
 
         self.assertEqual(rows[0]["Symbol"], "SCHD")
         self.assertEqual(rows[0]["Source"], "Schwab")
@@ -585,12 +811,15 @@ class SchwabMarketDataToolTests(unittest.TestCase):
                 }
             ],
         }
-        with patch.object(server, "_fetch_all", return_value=[]), patch.object(
+        with patch.object(server, "_current_user_id", return_value="user-1"), patch.object(
+            server, "_fetch_all", return_value=[]
+        ), patch.object(
             server,
             "_schwab_cached_market_data_get",
             return_value=payload,
         ) as schwab_get:
             rows = server.get_price_history(
+                None,
                 "NEW",
                 start_date="2026-08-25",
                 end_date="2026-08-26",
@@ -603,29 +832,286 @@ class SchwabMarketDataToolTests(unittest.TestCase):
 
     def test_cache_returns_copies_and_avoids_duplicate_provider_calls(self) -> None:
         server._SCHWAB_RESPONSE_CACHE.clear()
-        with patch.object(
-            server,
-            "_schwab_market_data_get",
-            return_value={"value": [1]},
-        ) as provider_get:
-            first = server._schwab_cached_market_data_get(
-                "/quotes",
-                {"symbols": "VOO"},
-                ttl_seconds=15,
-            )
-            first["value"].append(2)
-            second = server._schwab_cached_market_data_get(
-                "/quotes",
-                {"symbols": "VOO"},
-                ttl_seconds=15,
-            )
+        metrics = server.RequestUsageMetrics()
+        metrics_token = server._REQUEST_USAGE_METRICS.set(metrics)
+        try:
+            with patch.object(
+                server,
+                "_schwab_market_data_get",
+                return_value={"value": [1]},
+            ) as provider_get, patch.object(
+                server,
+                "_reserve_schwab_user_capacity",
+            ) as reserve_capacity:
+                first = server._schwab_cached_market_data_get(
+                    "/quotes",
+                    {"symbols": "VOO"},
+                    ttl_seconds=15,
+                    user_id="user-1",
+                )
+                first["value"].append(2)
+                second = server._schwab_cached_market_data_get(
+                    "/quotes",
+                    {"symbols": "VOO"},
+                    ttl_seconds=15,
+                    user_id="user-1",
+                )
+        finally:
+            server._REQUEST_USAGE_METRICS.reset(metrics_token)
 
         provider_get.assert_called_once()
+        reserve_capacity.assert_called_once_with(
+            "user-1",
+            1,
+            is_history=False,
+        )
+        self.assertEqual(metrics.schwab_units, 1)
+        self.assertEqual(metrics.schwab_cache_hits, 1)
         self.assertEqual(second, {"value": [1]})
 
+    def test_quotes_reject_more_than_two_hundred_unique_symbols(self) -> None:
+        symbols = [f"S{index}" for index in range(201)]
+        with patch.object(
+            server,
+            "_current_user_id",
+            return_value="user-1",
+        ), self.assertRaisesRegex(ValueError, "at most 200"):
+            server.get_latest_prices(None, symbols)
+
+    def test_quote_units_scale_by_fifty_symbols(self) -> None:
+        symbols = [f"S{index}" for index in range(51)]
+        with patch.object(
+            server,
+            "_current_user_id",
+            return_value="user-1",
+        ), patch.object(
+            server,
+            "_schwab_cached_market_data_get",
+            return_value={},
+        ) as schwab_get, patch.object(server, "_fetch_all", return_value=[]):
+            server.get_latest_prices(None, symbols)
+
+        self.assertEqual(schwab_get.call_args.kwargs["units"], 2)
+
+
+class RateLimitTests(unittest.TestCase):
+    def test_token_bucket_returns_retry_after_when_burst_is_empty(self) -> None:
+        limiter = server._TokenBucketLimiter(rate_per_minute=60, capacity=2)
+        self.assertIsNone(limiter.consume("user"))
+        self.assertIsNone(limiter.consume("user"))
+        self.assertGreaterEqual(limiter.consume("user"), 1)
+
+    def test_rate_limit_error_is_structured_and_safe(self) -> None:
+        error = server.RateLimitExceeded(
+            "schwab_user_daily",
+            120,
+            limit=100,
+            unit="units_per_utc_day",
+        )
+        self.assertIn('"error":"rate_limit_exceeded"', str(error))
+        self.assertIn(
+            '"message":"Your daily Schwab market-data allowance has been reached. '
+            'Retry in 120 seconds."',
+            str(error),
+        )
+        self.assertIn('"retry_after_seconds":120', str(error))
+        self.assertNotIn("token", str(error).lower())
+
+    def test_limit_message_has_safe_fallback_and_singular_retry(self) -> None:
+        message = server._limit_message("future_limit_scope", 1)
+
+        self.assertEqual(
+            message,
+            "The requested operation has reached a usage limit. "
+            "Retry in 1 second.",
+        )
+
+    def test_general_limit_rejects_repeated_calls_from_one_token(self) -> None:
+        token_limiter = server._TokenBucketLimiter(1, 1)
+        user_limiter = server._TokenBucketLimiter(60, 5)
+
+        with patch.object(
+            server,
+            "_MCP_TOKEN_LIMITER",
+            token_limiter,
+        ), patch.object(
+            server,
+            "_MCP_USER_LIMITER",
+            user_limiter,
+        ), patch.object(
+            server,
+            "MCP_TOKEN_RATE_PER_MINUTE",
+            1,
+        ):
+            server._enforce_general_mcp_limit("user-id", "token-one")
+            with self.assertRaises(server.RateLimitExceeded) as raised:
+                server._enforce_general_mcp_limit("user-id", "token-one")
+            server._enforce_general_mcp_limit("user-id", "token-two")
+
+        self.assertEqual(raised.exception.scope, "mcp_token_minute")
+
+    def test_general_user_limit_aggregates_different_tokens(self) -> None:
+        token_limiter = server._TokenBucketLimiter(60, 5)
+        user_limiter = server._TokenBucketLimiter(1, 1)
+
+        with patch.object(
+            server,
+            "_MCP_TOKEN_LIMITER",
+            token_limiter,
+        ), patch.object(
+            server,
+            "_MCP_USER_LIMITER",
+            user_limiter,
+        ), patch.object(
+            server,
+            "MCP_USER_RATE_PER_MINUTE",
+            1,
+        ):
+            server._enforce_general_mcp_limit("user-id", "token-one")
+            with self.assertRaises(server.RateLimitExceeded) as raised:
+                server._enforce_general_mcp_limit("user-id", "token-two")
+
+        self.assertEqual(raised.exception.scope, "mcp_user_minute")
+
+    def test_current_user_id_enforces_general_limit_by_database_user(self) -> None:
+        with patch.object(
+            server,
+            "_request_authentication_subject",
+            return_value="local:andreySr",
+        ), patch.object(
+            server,
+            "_fetch_one",
+            return_value={"UserId": "user-guid"},
+        ), patch.object(server, "_enforce_general_mcp_limit") as enforce:
+            user_id = server._current_user_id(None)
+
+        self.assertEqual(user_id, "user-guid")
+        enforce.assert_called_once_with("user-guid")
+
+    def test_current_user_id_enforces_token_and_user_limits(self) -> None:
+        request = type(
+            "Request",
+            (),
+            {
+                "scope": {
+                    "state": {
+                        "user_id": "user-guid",
+                        "token_rate_key": "token-guid",
+                    }
+                }
+            },
+        )()
+        request_context = type(
+            "RequestContext",
+            (),
+            {"request": request},
+        )()
+        ctx = type("Context", (), {"request_context": request_context})()
+
+        with patch.object(server, "_enforce_general_mcp_limit") as enforce:
+            user_id = server._current_user_id(ctx)
+
+        self.assertEqual(user_id, "user-guid")
+        enforce.assert_called_once_with("user-guid", "token-guid")
+
+
+class TokenUsageTests(unittest.TestCase):
+    def test_parses_tool_name_without_retaining_arguments(self) -> None:
+        body = (
+            b'{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+            b'"params":{"name":"get_latest_prices",'
+            b'"arguments":{"secret":"must-not-be-logged"}}}'
+        )
+        self.assertEqual(
+            server._parse_mcp_request_metadata(body),
+            ("tools/call", "get_latest_prices"),
+        )
+
+    def test_client_ip_defaults_to_network_prefix(self) -> None:
+        scope = {
+            "headers": [(b"cf-connecting-ip", b"203.0.113.42")],
+            "client": ("127.0.0.1", 12345),
+        }
+        with patch.object(server, "MCP_TOKEN_USAGE_IP_MODE", "prefix"):
+            address, network = server._client_network_metadata(scope)
+
+        self.assertIsNone(address)
+        self.assertEqual(network, "203.0.113.0/24")
+
+    def test_detects_mcp_tool_error_without_storing_response(self) -> None:
+        self.assertEqual(
+            server._parse_mcp_response_error(
+                b'{"jsonrpc":"2.0","id":1,"result":{"isError":true}}'
+            ),
+            "ToolError",
+        )
+
+    def test_usage_insert_contains_metadata_but_not_request_arguments(self) -> None:
+        now = datetime.now(timezone.utc)
+        identity = server.AuthIdentity(
+            authentication_subject="local:user",
+            user_id="00000000-0000-0000-0000-000000000001",
+            api_token_id="00000000-0000-0000-0000-000000000002",
+            token_key="token-id",
+        )
+        scope = {
+            "method": "POST",
+            "path": "/mcp",
+            "headers": [
+                (b"host", b"mcp.wiselinetrade.com"),
+                (b"cf-connecting-ip", b"203.0.113.42"),
+                (b"cf-ipcountry", b"US"),
+                (b"cf-ray", b"test-ray"),
+                (b"user-agent", b"Codex/test"),
+                (b"mcp-session-id", b"private-session-id"),
+            ],
+        }
+        body = (
+            b'{"method":"tools/call","params":{"name":"get_my_accounts",'
+            b'"arguments":{"secret":"must-not-be-logged"}}}'
+        )
+        metrics = server.RequestUsageMetrics(
+            schwab_units=2,
+            schwab_upstream_requests=1,
+            schwab_cache_hits=3,
+        )
+
+        with patch.object(server, "_fetch_all", return_value=[]) as fetch_all, patch.object(
+            server,
+            "MCP_TOKEN_USAGE_IP_MODE",
+            "prefix",
+        ):
+            server._record_api_token_usage(
+                identity=identity,
+                scope=scope,
+                captured_body=body,
+                captured_response=b'{"result":{"isError":false}}',
+                request_bytes=len(body),
+                response_bytes=25,
+                response_status=200,
+                started_at=now,
+                completed_at=now,
+                duration_ms=12,
+                error_type=None,
+                metrics=metrics,
+            )
+
+        sql, params = fetch_all.call_args.args
+        self.assertIn("invest.RecordApiTokenUsage", sql)
+        self.assertEqual(params[8:12], ("tools/call", "get_my_accounts", 200, "Success"))
+        self.assertEqual(params[20], None)
+        self.assertEqual(params[21], "203.0.113.0/24")
+        self.assertEqual(params[22], "US")
+        self.assertEqual(params[25], "test-ray")
+        self.assertIsInstance(params[26], bytes)
+        self.assertNotIn("must-not-be-logged", repr(params))
+        self.assertNotIn("private-session-id", repr(params))
+
     def test_market_hours_rejects_options(self) -> None:
-        with self.assertRaisesRegex(ValueError, "equity"):
-            server.get_market_hours(markets=["option"])
+        with patch.object(server, "_current_user_id", return_value="user-1"), self.assertRaisesRegex(
+            ValueError, "equity"
+        ):
+            server.get_market_hours(None, markets=["option"])
 
     def test_market_hours_and_movers_call_only_read_only_endpoints(self) -> None:
         responses = [
@@ -645,12 +1131,17 @@ class SchwabMarketDataToolTests(unittest.TestCase):
             server,
             "_schwab_cached_market_data_get",
             side_effect=responses,
-        ) as schwab_get:
+        ) as schwab_get, patch.object(
+            server,
+            "_current_user_id",
+            return_value="user-1",
+        ):
             hours = server.get_market_hours(
+                None,
                 markets=["equity"],
                 market_date="2026-08-26",
             )
-            movers = server.get_market_movers(index_symbol="$SPX")
+            movers = server.get_market_movers(None, index_symbol="$SPX")
 
         self.assertTrue(hours["Markets"]["equity"]["isOpen"])
         self.assertEqual(movers["Movers"][0]["Symbol"], "ABC")
@@ -658,6 +1149,106 @@ class SchwabMarketDataToolTests(unittest.TestCase):
             [call_args.args[0] for call_args in schwab_get.call_args_list],
             ["/markets", "/movers/$SPX"],
         )
+
+
+class InstrumentViewSafetyTests(unittest.TestCase):
+    def test_server_queries_do_not_read_series_table_directly(self) -> None:
+        source = Path(server.__file__).read_text(encoding="utf-8-sig")
+        self.assertIsNone(
+            re.search(r"\b(?:FROM|JOIN)\s+dbo\.Series\b", source, re.IGNORECASE)
+        )
+        self.assertIn("FROM invest.McpInstruments", source)
+        self.assertIn("JOIN invest.McpInstruments", source)
+
+    def test_migration_filters_internal_series_and_restricts_table(self) -> None:
+        migration = (
+            Path(server.__file__).parent
+            / "sql"
+            / "009_create_mcp_instruments_view.sql"
+        ).read_text(encoding="utf-8-sig")
+        self.assertIn("CREATE OR ALTER VIEW invest.McpInstruments", migration)
+        self.assertIn("NOT IN ('TEMP', 'PORTF')", migration)
+        view_select = migration.split("AS", 1)[1].split("FROM dbo.Series", 1)[0]
+        for excluded_column in {
+            "ISymbol",
+            "Active",
+            "IsWatched",
+            "IsTraded",
+            "TradePrice",
+            "TradeDate",
+            "MaxDataDate",
+            "MinDataDate",
+            "Updated",
+        }:
+            self.assertNotIn(excluded_column, view_select)
+        self.assertIn(
+            "DENY SELECT ON OBJECT::dbo.Series TO [mcp_connector]",
+            migration,
+        )
+        self.assertIn(
+            "GRANT SELECT ON OBJECT::invest.McpInstruments TO [mcp_connector]",
+            migration,
+        )
+
+    def test_membership_tools_use_research_procedure_filters(self) -> None:
+        with patch.object(
+            server,
+            "_load_research_rows",
+            return_value=[],
+        ) as load_research, patch.object(
+            server,
+            "_current_user_id",
+            return_value="user-1",
+        ):
+            server.get_watched_symbols(None, limit=25)
+            server.get_traded_symbols(None, limit=30)
+
+        self.assertEqual(
+            load_research.call_args_list,
+            [
+                call(watched_only=True, limit=25),
+                call(traded_only=True, limit=30),
+            ],
+        )
+
+
+class TokenUsageMigrationTests(unittest.TestCase):
+    def test_usage_migration_is_least_privilege_and_omits_payloads(self) -> None:
+        migration = (
+            Path(server.__file__).parent
+            / "sql"
+            / "010_add_api_token_usage_log.sql"
+        ).read_text(encoding="utf-8-sig")
+
+        self.assertIn("CREATE TABLE invest.ApiTokenUsageLog", migration)
+        self.assertIn("CREATE OR ALTER PROCEDURE invest.RecordApiTokenUsage", migration)
+        self.assertIn("CREATE OR ALTER VIEW invest.ApiTokenUsageDaily", migration)
+        self.assertIn(
+            "GRANT EXECUTE ON OBJECT::invest.RecordApiTokenUsage",
+            migration,
+        )
+        self.assertIn(
+            "DENY SELECT, INSERT, UPDATE, DELETE",
+            migration,
+        )
+        self.assertNotIn("RequestBody", migration)
+        self.assertNotIn("ResponseBody", migration)
+        self.assertNotIn("AuthorizationHeader", migration)
+
+
+class ActiveTokenLimitMigrationTests(unittest.TestCase):
+    def test_issue_token_limits_each_user_to_two_active_tokens(self) -> None:
+        migration = (
+            Path(server.__file__).parent
+            / "sql"
+            / "011_limit_active_api_tokens.sql"
+        ).read_text(encoding="utf-8-sig")
+
+        self.assertIn("CREATE OR ALTER PROCEDURE invest.IssueApiToken", migration)
+        self.assertIn("WITH (UPDLOCK, HOLDLOCK)", migration)
+        self.assertIn("RevokedAt IS NULL", migration)
+        self.assertIn("ExpiresAt IS NULL OR ExpiresAt > @Now", migration)
+        self.assertIn("IF @ActiveTokenCount >= 2", migration)
 
 
 if __name__ == "__main__":
