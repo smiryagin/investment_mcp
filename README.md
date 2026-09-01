@@ -128,6 +128,7 @@ Run these in order against the investment database:
 9. `sql/009_create_mcp_instruments_view.sql`
 10. `sql/010_add_api_token_usage_log.sql`
 11. `sql/011_limit_active_api_tokens.sql`
+12. `sql/012_add_portal_integration.sql`
 
 The second migration adds idempotency records, order status history, the
 `(UserId, AccountId, ClientOrderId)` uniqueness rule, and soft-deletion fields.
@@ -138,6 +139,13 @@ internal `TEMP` and `PORTF` calculation series; and omits status, watch/trade,
 fallback-price, alternate-symbol, and data-range fields. It grants
 `mcp_connector` access to the view and denies direct reads from `dbo.Series`.
 Watched/traded tools use the filtered research procedure instead of the view.
+
+Migration `012` adds the least-privilege WiseLinePortal contract. It provisions
+portal identities idempotently, synchronizes paid/trial entitlement boundaries,
+exposes owned portfolio summaries and positions, and wraps MCP token management.
+The portal runtime receives procedure execution only; it does not receive direct
+table access. Existing non-portal Investment MCP users remain independent of the
+portal entitlement table.
 
 ## Schwab OAuth access-token refresh
 

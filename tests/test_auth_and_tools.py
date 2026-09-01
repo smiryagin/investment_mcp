@@ -1251,5 +1251,31 @@ class ActiveTokenLimitMigrationTests(unittest.TestCase):
         self.assertIn("IF @ActiveTokenCount >= 2", migration)
 
 
+class PortalIntegrationMigrationTests(unittest.TestCase):
+    def test_portal_contract_is_entitlement_aware_and_least_privilege(self) -> None:
+        migration = (
+            Path(server.__file__).parent
+            / "sql"
+            / "012_add_portal_integration.sql"
+        ).read_text(encoding="utf-8-sig")
+
+        self.assertIn("CREATE TABLE invest.PortalUserEntitlements", migration)
+        self.assertIn("CREATE OR ALTER PROCEDURE invest.Portal_EnsureUser", migration)
+        self.assertIn("CREATE OR ALTER PROCEDURE invest.Portal_SetEntitlement", migration)
+        self.assertIn("CREATE OR ALTER PROCEDURE invest.Portal_GetPortfolios", migration)
+        self.assertIn("CREATE OR ALTER PROCEDURE invest.Portal_GetPortfolio", migration)
+        self.assertIn("CREATE OR ALTER PROCEDURE invest.Portal_CreateMcpToken", migration)
+        self.assertIn("LEFT JOIN invest.PortalUserEntitlements", migration)
+        self.assertIn("entitlement.IsEntitled = 1", migration)
+        self.assertIn("CREATE ROLE [investment_portal_runtime]", migration)
+        self.assertIn("TO [investment_portal_runtime]", migration)
+        self.assertIn("ADD MEMBER [InvestmentPortal_Connector]", migration)
+        self.assertIn(
+            "DENY SELECT, INSERT, UPDATE, DELETE ON SCHEMA::invest",
+            migration,
+        )
+        self.assertNotIn("GRANT SELECT ON OBJECT::invest.ApiTokens", migration)
+
+
 if __name__ == "__main__":
     unittest.main()
