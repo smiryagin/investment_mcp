@@ -82,6 +82,14 @@ env = { SQLSERVER_CONN = "DRIVER={ODBC Driver 17 for SQL Server};SERVER=localhos
 - `get_data_freshness`
 - `get_market_indicators`
 
+Global scoring and candidate-review tools:
+
+- `get_reference_universe`
+- `get_scoring_model`
+- `score_instrument`
+- `rank_candidates`
+- `get_score_history`
+
 Caller-scoped portfolio tools:
 
 - `create_account`
@@ -136,6 +144,9 @@ Run these in order against the investment database:
 10. `sql/010_add_api_token_usage_log.sql`
 11. `sql/011_limit_active_api_tokens.sql`
 12. `sql/012_add_portal_integration.sql`
+13. `sql/013_add_reference_instrument_classification.sql`
+14. `sql/014_add_investment_scoring.sql`
+15. `sql/015_grant_scoring_runtime.sql`
 
 The second migration adds idempotency records, order status history, the
 `(UserId, AccountId, ClientOrderId)` uniqueness rule, and soft-deletion fields.
@@ -153,6 +164,70 @@ exposes owned portfolio summaries and positions, and wraps MCP token management.
 The portal runtime receives procedure execution only; it does not receive direct
 table access. Existing non-portal Investment MCP users remain independent of the
 portal entitlement table.
+
+Migration `013` keeps `dbo.Series` as the one global curated reference
+universe. It adds scoring classifications, backfills active instruments, and
+installs a set-based `AFTER INSERT, UPDATE` trigger. The trigger uses local SQL
+rules only, preserves manual classifications, and marks uncertain instruments
+for review. The existing symbol-management application does not need to call a
+new procedure.
+
+Review an automatic classification and, when necessary, replace it without
+changing the symbol-management application:
+
+```sql
+EXEC invest.SetReferenceInstrumentClassification
+    @Symbol = 'VBR',
+    @CandidateClass = 'ETF',
+    @Archetype = 'SmallMidFactorEquity',
+    @InclusionReason = N'Small-value portfolio role';
+```
+
+Migration `014` adds immutable model definitions, shared feature/score
+snapshots, and caller/account-scoped portfolio-fit snapshots. Migration `015`
+grants the runtime access to the safe scoring view and snapshot procedures but
+denies direct scoring-table writes.
+
+## Transparent investment scoring
+
+`invest.McpScoringReferenceInstruments` is the safe global scoring view over
+active `dbo.Series` instruments. `TEMP` and `PORTF` remain excluded. Instruments
+with `NeedsReview=1` remain visible for review but are not used as scoring peers.
+
+The scoring engine is implemented in `scoring/` and uses no additional Python
+packages. It calculates class/archetype-relative quality, valuation, growth,
+trend, risk, liquidity, and nearest-peer similarity. Missing properties receive
+a disclosed neutral contribution rather than zero; `DataCompletenessScore` and
+`MissingFeatures` make the limitation visible.
+
+Without an account, `score_instrument` returns `StandaloneCandidateScore`.
+When a caller-owned `account_id` is supplied, it also returns a portfolio-fit
+score and the configured composite score. Portfolio fit version 1 uses owned
+positions and classification concentration. It explicitly reports that
+fund-holdings overlap and portfolio-return correlation are not yet available.
+
+Configure the service with:
+
+```text
+MCP_SCORING_MODEL_VERSION=1.0
+MCP_SCORING_BENCHMARK=VOO
+MCP_SCORING_MIN_PEER_COUNT=5
+MCP_SCORING_MAX_CANDIDATES=10
+MCP_SCORING_DEFAULT_TARGET_WEIGHT_PERCENT=2
+MCP_SCORING_PERSIST_SNAPSHOTS=true
+```
+
+After the daily price-data load, refresh shared scores from the server project
+directory with:
+
+```powershell
+$env:MCP_SCORING_REFRESH_AUTH_SUBJECT = 'local:andreySr'
+.\.venv\Scripts\python.exe .\scripts\refresh_scoring.py
+```
+
+This can later run as a Windows Scheduled Task. Deploy `server.py`, the complete
+`scoring` directory, and `scripts/refresh_scoring.py`; copying only `server.py`
+is no longer sufficient.
 
 ## Schwab OAuth access-token refresh
 
@@ -366,7 +441,7 @@ The user's Codex configuration continues to reference an environment variable:
 
 ```toml
 [mcp_servers.investments]
-url = "https://investments-mcp.torusystems.com/mcp"
+url = "https://mcp.wiselinetrade.com/mcp"
 bearer_token_env_var = "INVESTMENTS_MCP_TOKEN"
 startup_timeout_sec = 30
 tool_timeout_sec = 120

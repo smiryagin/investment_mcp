@@ -32,6 +32,14 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 import uvicorn
 
+from scoring import (
+    classify_instrument as classify_scoring_instrument,
+    compute_portfolio_fit,
+    compute_price_features,
+    review_tier as scoring_review_tier,
+    score_candidate,
+)
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -150,6 +158,29 @@ SCHWAB_MAX_CONCURRENT_REQUESTS = int(
     os.getenv("SCHWAB_MAX_CONCURRENT_REQUESTS", "5")
 )
 SCHWAB_MAX_QUOTE_SYMBOLS = int(os.getenv("SCHWAB_MAX_QUOTE_SYMBOLS", "200"))
+
+SCORING_MODEL_VERSION = os.getenv("MCP_SCORING_MODEL_VERSION", "1.0").strip()
+SCORING_BENCHMARK = _cleaned_scoring_benchmark = os.getenv(
+    "MCP_SCORING_BENCHMARK",
+    "VOO",
+).strip().upper()
+if not SYMBOL_RE.match(_cleaned_scoring_benchmark):
+    raise RuntimeError("MCP_SCORING_BENCHMARK is not a valid symbol.")
+SCORING_MIN_PEER_COUNT = max(
+    2,
+    int(os.getenv("MCP_SCORING_MIN_PEER_COUNT", "5")),
+)
+SCORING_MAX_CANDIDATES = max(
+    1,
+    min(int(os.getenv("MCP_SCORING_MAX_CANDIDATES", "10")), 50),
+)
+SCORING_DEFAULT_TARGET_WEIGHT_PERCENT = float(
+    os.getenv("MCP_SCORING_DEFAULT_TARGET_WEIGHT_PERCENT", "2")
+)
+SCORING_PERSIST_SNAPSHOTS = os.getenv(
+    "MCP_SCORING_PERSIST_SNAPSHOTS",
+    "true",
+).lower() in {"1", "true", "yes", "on"}
 
 _SCHWAB_TOKEN_REFRESH_LOCK = threading.Lock()
 _SCHWAB_RESPONSE_CACHE_LOCK = threading.Lock()
@@ -2075,6 +2106,461 @@ def _load_research_rows(
     return rows[:limit]
 
 
+def _load_scoring_reference_rows() -> list[dict[str, Any]]:
+    """Load the global dbo.Series-backed universe with current research fields."""
+    catalog_rows = _fetch_all(
+        """
+        SELECT
+            SeriesId,
+            Symbol,
+            Name,
+            Type,
+            PE,
+            Volatility,
+            Yield,
+            EPS,
+            DivAmount,
+            Exchange,
+            AssetType,
+            AssetSubType,
+            CandidateClass,
+            Archetype,
+            ClassificationMethod,
+            ClassificationConfidence,
+            ClassificationRuleVersion,
+            NeedsReview,
+            InclusionReason,
+            ClassificationUpdatedAt
+        FROM invest.McpScoringReferenceInstruments
+        ORDER BY Symbol;
+        """
+    )
+    research_by_symbol = {
+        str(row.get("Symbol") or "").upper(): row
+        for row in _load_research_rows(limit=MAX_ROWS)
+    }
+    merged_rows: list[dict[str, Any]] = []
+    for catalog_row in catalog_rows:
+        merged = dict(catalog_row)
+        research = research_by_symbol.get(
+            str(catalog_row.get("Symbol") or "").upper()
+        )
+        if research:
+            merged.update(
+                {key: value for key, value in research.items() if value is not None}
+            )
+        merged_rows.append(merged)
+    return merged_rows
+
+
+def _load_scoring_history(
+    symbol: str,
+    user_id: str,
+    as_of: date,
+) -> list[dict[str, Any]]:
+    start_date = as_of - timedelta(days=365 * 4)
+    local_rows = _fetch_all(
+        f"""
+        SELECT TOP ({MAX_ROWS})
+            instrument.Symbol,
+            history.Date,
+            history.OpenValue,
+            history.HighValue,
+            history.LowValue,
+            history.LastValue,
+            history.Volume,
+            history.Updated
+        FROM dbo.SeriesData AS history
+        INNER JOIN invest.McpInstruments AS instrument
+            ON instrument.SeriesId = history.SeriesId
+        WHERE UPPER(instrument.Symbol) = ?
+          AND history.Date >= ?
+          AND history.Date <= ?
+        ORDER BY history.Date;
+        """,
+        (symbol, start_date, as_of),
+    )
+    if local_rows:
+        return [{**row, "Source": "SQL"} for row in local_rows]
+
+    start_timestamp = int(
+        datetime.combine(start_date, datetime_time.min, tzinfo=timezone.utc).timestamp()
+        * 1000
+    )
+    end_timestamp = int(
+        datetime.combine(as_of, datetime_time.max, tzinfo=timezone.utc).timestamp()
+        * 1000
+    )
+    payload = _schwab_cached_market_data_get(
+        "/pricehistory",
+        {
+            "symbol": symbol,
+            "periodType": "year",
+            "frequencyType": "daily",
+            "frequency": 1,
+            "startDate": start_timestamp,
+            "endDate": end_timestamp,
+            "needExtendedHoursData": "false",
+            "needPreviousClose": "true",
+        },
+        ttl_seconds=900,
+        user_id=user_id,
+        units=5,
+        is_history=True,
+    )
+    return _schwab_history_rows(payload, symbol, MAX_ROWS)
+
+
+def _prepare_scoring_candidate(
+    symbol: str,
+    user_id: str,
+    reference_rows: list[dict[str, Any]],
+    score_as_of: date,
+    benchmark_history: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    local = next(
+        (
+            dict(row)
+            for row in reference_rows
+            if str(row.get("Symbol") or "").upper() == symbol
+        ),
+        None,
+    )
+    if local is None:
+        payload = _schwab_cached_market_data_get(
+            "/quotes",
+            {
+                "symbols": symbol,
+                "fields": "quote,reference,fundamental",
+                "indicative": "false",
+            },
+            ttl_seconds=15,
+            user_id=user_id,
+            units=1,
+        )
+        instrument_rows = _schwab_quote_rows(payload, [symbol])
+        local = dict(instrument_rows[0]) if instrument_rows else None
+        if local is None:
+            raise ValueError("Instrument not found.")
+        local.update(classify_scoring_instrument(local))
+
+    history = (
+        benchmark_history
+        if symbol == SCORING_BENCHMARK
+        else _load_scoring_history(symbol, user_id, score_as_of)
+    )
+    if not history:
+        raise ValueError("No price history is available for this instrument.")
+    price_features = compute_price_features(
+        history,
+        benchmark_history,
+        as_of=score_as_of,
+    )
+    candidate = dict(local)
+    candidate.update(price_features)
+    candidate["Symbol"] = symbol
+    candidate["HistorySource"] = history[0].get("Source") if history else None
+    return candidate, price_features
+
+
+def _owned_scoring_positions(
+    user_id: str,
+    account_id: str,
+    reference_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    account = _fetch_all(
+        """
+        SELECT AccountId
+        FROM invest.Accounts
+        WHERE AccountId = ?
+          AND OwnerUserId = ?
+          AND IsActive = 1;
+        """,
+        (account_id, user_id),
+    )
+    if not account:
+        raise ValueError("Account not found.")
+    positions = _fetch_all(
+        """
+        SELECT
+            t.Symbol,
+            SUM(
+                CASE
+                    WHEN UPPER(t.TransactionType) IN
+                         ('BUY', 'PURCHASE', 'OPENING_POSITION')
+                        THEN COALESCE(t.Quantity, 0)
+                    WHEN UPPER(t.TransactionType) IN ('SELL', 'SALE')
+                        THEN -COALESCE(t.Quantity, 0)
+                    ELSE 0
+                END
+            ) AS Quantity
+        FROM invest.Transactions AS t
+        INNER JOIN invest.Accounts AS a
+            ON a.AccountId = t.AccountId
+           AND a.OwnerUserId = t.UserId
+        WHERE t.UserId = ?
+          AND t.AccountId = ?
+          AND t.IsDeleted = 0
+          AND t.Symbol IS NOT NULL
+          AND a.IsActive = 1
+        GROUP BY t.Symbol
+        HAVING SUM(
+            CASE
+                WHEN UPPER(t.TransactionType) IN
+                     ('BUY', 'PURCHASE', 'OPENING_POSITION')
+                    THEN COALESCE(t.Quantity, 0)
+                WHEN UPPER(t.TransactionType) IN ('SELL', 'SALE')
+                    THEN -COALESCE(t.Quantity, 0)
+                ELSE 0
+            END
+        ) <> 0;
+        """,
+        (user_id, account_id),
+    )
+    price_by_symbol = {
+        str(row.get("Symbol") or "").upper(): _number(row.get("LastValue"))
+        for row in reference_rows
+    }
+    for position in positions:
+        symbol = str(position.get("Symbol") or "").upper()
+        quantity = abs(_number(position.get("Quantity")) or 0.0)
+        price = price_by_symbol.get(symbol)
+        position["MarketValue"] = quantity * price if price is not None else None
+    return positions
+
+
+def _persist_scoring_snapshot(
+    candidate: dict[str, Any],
+    price_features: dict[str, Any],
+    score: dict[str, Any],
+) -> str | None:
+    if not SCORING_PERSIST_SNAPSHOTS:
+        return None
+    try:
+        feature_rows = _fetch_all(
+            """
+            EXEC invest.UpsertInstrumentFeatureSnapshot
+                @SeriesId = ?,
+                @Symbol = ?,
+                @CandidateClass = ?,
+                @Archetype = ?,
+                @FeatureAsOf = ?,
+                @PriceFeaturesJson = ?,
+                @FundamentalFeaturesJson = ?,
+                @ExposureFeaturesJson = ?,
+                @DataSourcesJson = ?,
+                @DataCompletenessScore = ?,
+                @ModelVersion = ?;
+            """,
+            (
+                candidate.get("SeriesId"),
+                score["Symbol"],
+                score["CandidateClass"],
+                score["Archetype"],
+                score["ScoreAsOf"],
+                json.dumps(price_features, default=_serialize, separators=(",", ":")),
+                json.dumps(candidate, default=_serialize, separators=(",", ":")),
+                json.dumps(
+                    {
+                        "CandidateClass": score["CandidateClass"],
+                        "Archetype": score["Archetype"],
+                    },
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    {
+                        "History": candidate.get("HistorySource"),
+                        "Fundamentals": candidate.get("Source", "SQL"),
+                    },
+                    separators=(",", ":"),
+                ),
+                score["DataCompletenessScore"],
+                score["ModelVersion"],
+            ),
+        )
+        feature_snapshot_id = (
+            feature_rows[0].get("FeatureSnapshotId") if feature_rows else None
+        )
+        score_rows = _fetch_all(
+            """
+            EXEC invest.UpsertInstrumentScoreSnapshot
+                @FeatureSnapshotId = ?,
+                @Symbol = ?,
+                @CandidateClass = ?,
+                @Archetype = ?,
+                @QualityScore = ?,
+                @ValuationScore = ?,
+                @GrowthScore = ?,
+                @TrendScore = ?,
+                @RiskScore = ?,
+                @LiquidityCostScore = ?,
+                @InvestmentQualityScore = ?,
+                @TechnicalOpportunityScore = ?,
+                @ReferenceSimilarityScore = ?,
+                @StandaloneCandidateScore = ?,
+                @DataCompletenessScore = ?,
+                @PeerGroupLevel = ?,
+                @PeerCount = ?,
+                @ClosestPeersJson = ?,
+                @StrengthsJson = ?,
+                @ConcernsJson = ?,
+                @MissingFeaturesJson = ?,
+                @ScoreAsOf = ?,
+                @ModelVersion = ?;
+            """,
+            (
+                feature_snapshot_id,
+                score["Symbol"],
+                score["CandidateClass"],
+                score["Archetype"],
+                score["QualityScore"],
+                score["ValuationScore"],
+                score["GrowthScore"],
+                score["TrendScore"],
+                score["RiskScore"],
+                score["LiquidityCostScore"],
+                score["InvestmentQualityScore"],
+                score["TechnicalOpportunityScore"],
+                score["ReferenceSimilarityScore"],
+                score["StandaloneCandidateScore"],
+                score["DataCompletenessScore"],
+                score["PeerGroupLevel"],
+                score["PeerCount"],
+                json.dumps(score["ClosestReferenceSymbols"], separators=(",", ":")),
+                json.dumps(score["Strengths"], separators=(",", ":")),
+                json.dumps(score["Concerns"], separators=(",", ":")),
+                json.dumps(score["MissingFeatures"], separators=(",", ":")),
+                score["ScoreAsOf"],
+                score["ModelVersion"],
+            ),
+        )
+        return (
+            str(score_rows[0]["InstrumentScoreSnapshotId"])
+            if score_rows and score_rows[0].get("InstrumentScoreSnapshotId")
+            else None
+        )
+    except Exception:
+        LOGGER.exception("Unable to persist investment scoring snapshot.")
+        return None
+
+
+def _persist_portfolio_candidate_score(
+    user_id: str,
+    account_id: str,
+    instrument_score_snapshot_id: str | None,
+    score: dict[str, Any],
+) -> None:
+    if not SCORING_PERSIST_SNAPSHOTS or not instrument_score_snapshot_id:
+        return
+    try:
+        _fetch_all(
+            """
+            EXEC invest.UpsertPortfolioCandidateScoreSnapshot
+                @UserId = ?,
+                @AccountId = ?,
+                @InstrumentScoreSnapshotId = ?,
+                @TargetWeightPercent = ?,
+                @PortfolioFitScore = ?,
+                @CompositeCandidateScore = ?,
+                @ReviewTier = ?,
+                @PortfolioImpactJson = ?,
+                @ScoreAsOf = ?,
+                @ModelVersion = ?;
+            """,
+            (
+                user_id,
+                account_id,
+                instrument_score_snapshot_id,
+                score["PortfolioImpact"]["TargetWeightPercent"],
+                score["PortfolioFitScore"],
+                score["CompositeCandidateScore"],
+                score["ReviewTier"],
+                json.dumps(
+                    score["PortfolioImpact"],
+                    default=_serialize,
+                    separators=(",", ":"),
+                ),
+                score["ScoreAsOf"],
+                score["ModelVersion"],
+            ),
+        )
+    except Exception:
+        LOGGER.exception("Unable to persist portfolio candidate score snapshot.")
+
+
+def _score_symbol_for_user(
+    user_id: str,
+    symbol: str,
+    reference_rows: list[dict[str, Any]],
+    benchmark_history: list[dict[str, Any]],
+    *,
+    account_id: str | None,
+    target_weight_percent: float,
+    score_as_of: date,
+    owned_positions: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    candidate, price_features = _prepare_scoring_candidate(
+        symbol,
+        user_id,
+        reference_rows,
+        score_as_of,
+        benchmark_history,
+    )
+    score = score_candidate(
+        candidate,
+        reference_rows,
+        model_version=SCORING_MODEL_VERSION,
+        score_as_of=score_as_of,
+        minimum_peer_count=SCORING_MIN_PEER_COUNT,
+    )
+    instrument_score_snapshot_id = _persist_scoring_snapshot(
+        candidate,
+        price_features,
+        score,
+    )
+    if account_id is None:
+        return score
+
+    positions = (
+        owned_positions
+        if owned_positions is not None
+        else _owned_scoring_positions(user_id, account_id, reference_rows)
+    )
+    portfolio_fit = compute_portfolio_fit(
+        score,
+        positions,
+        reference_rows,
+        target_weight_percent=target_weight_percent,
+    )
+    similarity = score["ReferenceSimilarityScore"]
+    similarity_for_formula = similarity if similarity is not None else 50.0
+    composite = round(
+        score["InvestmentQualityScore"] * 0.35
+        + score["ValuationScore"] * 0.20
+        + score["TrendScore"] * 0.15
+        + portfolio_fit["PortfolioFitScore"] * 0.20
+        + similarity_for_formula * 0.10,
+        2,
+    )
+    if score["RiskScore"] < 25:
+        composite = min(composite, 69.0)
+    if score["LiquidityCostScore"] < 20:
+        composite = min(composite, 64.0)
+    score["AccountId"] = account_id
+    score["PortfolioFitScore"] = portfolio_fit["PortfolioFitScore"]
+    score["PortfolioImpact"] = portfolio_fit
+    score["CompositeCandidateScore"] = composite
+    score["ReviewTier"] = scoring_review_tier(composite)
+    score["Concerns"] = score["Concerns"] + portfolio_fit["Limitations"]
+    _persist_portfolio_candidate_score(
+        user_id,
+        account_id,
+        instrument_score_snapshot_id,
+        score,
+    )
+    return score
+
+
 @mcp.tool(annotations=OPEN_WORLD_READ_ONLY_TOOL)
 def search_symbols(
     ctx: Context,
@@ -2670,6 +3156,294 @@ def get_market_indicators(ctx: Context, limit: int = 100) -> list[dict[str, Any]
                          _number(_get(row, "Rank", "Score")) or 0),
         reverse=True,
     )[: _clamp_limit(limit)]
+
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def get_reference_universe(
+    ctx: Context,
+    candidate_class: str | None = None,
+    archetype: str | None = None,
+    include_needs_review: bool = False,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Return the global dbo.Series-backed investment reference universe."""
+    _current_user_id(ctx)
+    rows = _load_scoring_reference_rows()
+    if candidate_class:
+        expected_class = candidate_class.strip().casefold()
+        rows = [
+            row
+            for row in rows
+            if str(row.get("CandidateClass") or "").casefold() == expected_class
+        ]
+    if archetype:
+        expected_archetype = archetype.strip().casefold()
+        rows = [
+            row
+            for row in rows
+            if str(row.get("Archetype") or "").casefold() == expected_archetype
+        ]
+    if not include_needs_review:
+        rows = [row for row in rows if not _truthy(row.get("NeedsReview"))]
+    fields = (
+        "SeriesId",
+        "Symbol",
+        "Name",
+        "Type",
+        "AssetType",
+        "AssetSubType",
+        "CandidateClass",
+        "Archetype",
+        "ClassificationMethod",
+        "ClassificationConfidence",
+        "ClassificationRuleVersion",
+        "NeedsReview",
+        "InclusionReason",
+    )
+    return [
+        {field: row.get(field) for field in fields}
+        for row in rows[: _clamp_limit(limit, default=200)]
+    ]
+
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def get_scoring_model(
+    ctx: Context,
+    model_version: str | None = None,
+) -> dict[str, Any] | None:
+    """Return one immutable scoring-model definition and its explicit weights."""
+    _current_user_id(ctx)
+    requested_version = (model_version or SCORING_MODEL_VERSION).strip()
+    if not requested_version or len(requested_version) > 50:
+        raise ValueError("model_version must contain 1 to 50 characters.")
+    rows = _fetch_all(
+        """
+        SELECT
+            ModelVersion,
+            Description,
+            BenchmarkSymbol,
+            WeightsJson,
+            NormalizationJson,
+            ClassificationRuleVersion,
+            EffectiveAt,
+            IsActive,
+            CreatedAt
+        FROM invest.ScoringModelVersions
+        WHERE ModelVersion = ?;
+        """,
+        (requested_version,),
+    )
+    if not rows:
+        return None
+    result = dict(rows[0])
+    for field in ("WeightsJson", "NormalizationJson"):
+        raw = result.pop(field, None)
+        result[field.removesuffix("Json")] = json.loads(raw) if raw else {}
+    return result
+
+
+@mcp.tool(annotations=OPEN_WORLD_READ_ONLY_TOOL)
+def score_instrument(
+    symbol: str,
+    ctx: Context,
+    account_id: str | None = None,
+    target_weight_percent: float = SCORING_DEFAULT_TARGET_WEIGHT_PERCENT,
+) -> dict[str, Any]:
+    """Score any instrument against the global universe and optional owned account."""
+    user_id = _current_user_id(ctx)
+    cleaned_symbol = _clean_symbol(symbol)
+    normalized_account_id = (
+        _canonical_uuid(account_id, "account_id") if account_id else None
+    )
+    try:
+        normalized_target_weight = float(target_weight_percent)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("target_weight_percent must be numeric.") from exc
+    if not 0 < normalized_target_weight <= 25:
+        raise ValueError("target_weight_percent must be greater than 0 and at most 25.")
+
+    score_as_of = date.today()
+    reference_rows = _load_scoring_reference_rows()
+    benchmark_history = _load_scoring_history(
+        SCORING_BENCHMARK,
+        user_id,
+        score_as_of,
+    )
+    return _score_symbol_for_user(
+        user_id,
+        cleaned_symbol,
+        reference_rows,
+        benchmark_history,
+        account_id=normalized_account_id,
+        target_weight_percent=normalized_target_weight,
+        score_as_of=score_as_of,
+    )
+
+
+@mcp.tool(annotations=OPEN_WORLD_READ_ONLY_TOOL)
+def rank_candidates(
+    symbols: list[str],
+    ctx: Context,
+    account_id: str | None = None,
+    target_weight_percent: float = SCORING_DEFAULT_TARGET_WEIGHT_PERCENT,
+) -> dict[str, Any]:
+    """Score and rank a bounded list of candidates for review, never for trading."""
+    user_id = _current_user_id(ctx)
+    cleaned_symbols = _clean_symbols(symbols)
+    if len(cleaned_symbols) > SCORING_MAX_CANDIDATES:
+        raise ValueError(
+            f"At most {SCORING_MAX_CANDIDATES} candidates may be ranked per call."
+        )
+    normalized_account_id = (
+        _canonical_uuid(account_id, "account_id") if account_id else None
+    )
+    try:
+        normalized_target_weight = float(target_weight_percent)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("target_weight_percent must be numeric.") from exc
+    if not 0 < normalized_target_weight <= 25:
+        raise ValueError("target_weight_percent must be greater than 0 and at most 25.")
+
+    score_as_of = date.today()
+    reference_rows = _load_scoring_reference_rows()
+    benchmark_history = _load_scoring_history(
+        SCORING_BENCHMARK,
+        user_id,
+        score_as_of,
+    )
+    owned_positions = (
+        _owned_scoring_positions(user_id, normalized_account_id, reference_rows)
+        if normalized_account_id
+        else None
+    )
+    scored: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for cleaned_symbol in cleaned_symbols:
+        try:
+            scored.append(
+                _score_symbol_for_user(
+                    user_id,
+                    cleaned_symbol,
+                    reference_rows,
+                    benchmark_history,
+                    account_id=normalized_account_id,
+                    target_weight_percent=normalized_target_weight,
+                    score_as_of=score_as_of,
+                    owned_positions=owned_positions,
+                )
+            )
+        except (ValueError, SchwabApiError, RateLimitExceeded) as exc:
+            errors.append({"Symbol": cleaned_symbol, "Error": str(exc)})
+    ranking_field = (
+        "CompositeCandidateScore" if normalized_account_id else "StandaloneCandidateScore"
+    )
+    scored.sort(
+        key=lambda row: _number(row.get(ranking_field)) or -1.0,
+        reverse=True,
+    )
+    return {
+        "RankingField": ranking_field,
+        "ScoreAsOf": score_as_of.isoformat(),
+        "ModelVersion": SCORING_MODEL_VERSION,
+        "Candidates": scored,
+        "Errors": errors,
+    }
+
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def get_score_history(
+    symbol: str,
+    ctx: Context,
+    account_id: str | None = None,
+    limit: int = 30,
+) -> list[dict[str, Any]]:
+    """Return stored global or caller-owned portfolio-aware score snapshots."""
+    user_id = _current_user_id(ctx)
+    cleaned_symbol = _clean_symbol(symbol)
+    normalized_limit = _clamp_limit(limit, default=30)
+    if account_id:
+        normalized_account_id = _canonical_uuid(account_id, "account_id")
+        account = _fetch_all(
+            """
+            SELECT AccountId
+            FROM invest.Accounts
+            WHERE AccountId = ? AND OwnerUserId = ? AND IsActive = 1;
+            """,
+            (normalized_account_id, user_id),
+        )
+        if not account:
+            raise ValueError("Account not found.")
+        rows = _fetch_all(
+            f"""
+            SELECT TOP ({normalized_limit})
+                portfolio.AccountId,
+                instrument.Symbol,
+                portfolio.TargetWeightPercent,
+                portfolio.PortfolioFitScore,
+                portfolio.CompositeCandidateScore,
+                portfolio.ReviewTier,
+                portfolio.PortfolioImpactJson,
+                portfolio.ScoreAsOf,
+                portfolio.ModelVersion,
+                portfolio.CreatedAt
+            FROM invest.PortfolioCandidateScoreSnapshots AS portfolio
+            INNER JOIN invest.InstrumentScoreSnapshots AS instrument
+                ON instrument.InstrumentScoreSnapshotId =
+                   portfolio.InstrumentScoreSnapshotId
+            WHERE portfolio.UserId = ?
+              AND portfolio.AccountId = ?
+              AND instrument.Symbol = ?
+            ORDER BY portfolio.ScoreAsOf DESC, portfolio.CreatedAt DESC;
+            """,
+            (user_id, normalized_account_id, cleaned_symbol),
+        )
+        for row in rows:
+            raw = row.pop("PortfolioImpactJson", None)
+            row["PortfolioImpact"] = json.loads(raw) if raw else {}
+        return rows
+
+    rows = _fetch_all(
+        f"""
+        SELECT TOP ({normalized_limit})
+            Symbol,
+            CandidateClass,
+            Archetype,
+            InvestmentQualityScore,
+            ValuationScore,
+            TrendScore,
+            RiskScore,
+            LiquidityCostScore,
+            TechnicalOpportunityScore,
+            ReferenceSimilarityScore,
+            StandaloneCandidateScore,
+            DataCompletenessScore,
+            PeerGroupLevel,
+            PeerCount,
+            ClosestPeersJson,
+            StrengthsJson,
+            ConcernsJson,
+            MissingFeaturesJson,
+            ScoreAsOf,
+            ModelVersion,
+            CreatedAt,
+            UpdatedAt
+        FROM invest.InstrumentScoreSnapshots
+        WHERE Symbol = ?
+        ORDER BY ScoreAsOf DESC, UpdatedAt DESC;
+        """,
+        (cleaned_symbol,),
+    )
+    json_fields = {
+        "ClosestPeersJson": "ClosestReferenceSymbols",
+        "StrengthsJson": "Strengths",
+        "ConcernsJson": "Concerns",
+        "MissingFeaturesJson": "MissingFeatures",
+    }
+    for row in rows:
+        for source_field, output_field in json_fields.items():
+            raw = row.pop(source_field, None)
+            row[output_field] = json.loads(raw) if raw else []
+    return rows
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL)
@@ -4150,8 +4924,14 @@ dbo.SeriesData:
   LowValue, LastValue, Volume, Created, Updated, TradeTypeId.
 
 Research procedure:
-  The configured stored procedure returns performance, rank, PE, yield,
+  The configured stored procedure returns performance, PE, yield,
   volatility, Sharpe ratio, annualized return, and drawdown fields.
+
+invest.McpScoringReferenceInstruments and scoring snapshots:
+  dbo.Series is the global curated reference universe. A local SQL trigger
+  assigns transparent candidate classes and archetypes without changing the
+  existing symbol-management application. Global feature/score snapshots are
+  shared; portfolio-fit snapshots are restricted to the authenticated owner.
 
 Schwab market data:
   Read-only quotes, instrument profiles, daily price history, market hours,
