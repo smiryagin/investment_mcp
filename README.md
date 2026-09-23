@@ -103,6 +103,13 @@ Explicit sharing tools:
 - `revoke_portfolio_access`
 - `list_portfolio_access`
 - `get_shared_portfolios`
+- `get_shared_portfolio`
+
+`get_shared_portfolios` lists accounts shared with the caller.
+`get_shared_portfolio(account_id)` returns cash balances and transaction-derived
+positions only when the caller has an active, unexpired `VIEW` grant. It returns
+the same `Account not found` error for missing and inaccessible accounts and does
+not grant access to order or write operations.
 
 Write tools require UUID idempotency keys. Concurrent updates use SQL Server
 `rowversion` values returned as hexadecimal strings.

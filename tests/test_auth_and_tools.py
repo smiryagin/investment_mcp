@@ -373,6 +373,7 @@ class ToolSchemaTests(unittest.TestCase):
             "revoke_portfolio_access",
             "list_portfolio_access",
             "get_shared_portfolios",
+            "get_shared_portfolio",
         }
         registered = server.mcp._tool_manager._tools
         self.assertTrue(private_tools <= set(registered))
@@ -394,6 +395,7 @@ class ToolSchemaTests(unittest.TestCase):
         self.assertFalse(registered["create_limit_order_record"].annotations.readOnlyHint)
         self.assertTrue(registered["create_limit_order_record"].annotations.idempotentHint)
         self.assertTrue(registered["cancel_limit_order_record"].annotations.destructiveHint)
+        self.assertTrue(registered["get_shared_portfolio"].annotations.readOnlyHint)
 
     def test_order_tools_expose_duration_and_expiration(self) -> None:
         registered = server.mcp._tool_manager._tools
@@ -430,6 +432,54 @@ class ToolSchemaTests(unittest.TestCase):
             set(position_schema["required"]),
             {"symbol", "quantity", "total_cost_basis"},
         )
+
+
+class SharedPortfolioTests(unittest.TestCase):
+    def test_shared_portfolio_scopes_every_query_to_active_view_grant(self) -> None:
+        account_id = "00000000-0000-0000-0000-000000000010"
+        recipient_id = "00000000-0000-0000-0000-000000000020"
+        account = {"AccountId": account_id, "OwnerDisplayName": "Child"}
+        balance = {"AccountId": account_id, "TotalAmount": 125.0}
+        position = {"AccountId": account_id, "Symbol": "VOO", "Quantity": 2.0}
+
+        with patch.object(
+            server,
+            "_current_user_id",
+            return_value=recipient_id,
+        ), patch.object(
+            server,
+            "_fetch_all",
+            side_effect=[[account], [balance], [position]],
+        ) as fetch_all:
+            result = server.get_shared_portfolio(account_id, object())
+
+        self.assertEqual(result["accounts"], [account])
+        self.assertEqual(result["cash_balances"], [balance])
+        self.assertEqual(result["positions"], [position])
+        self.assertEqual(fetch_all.call_count, 3)
+        for query_call in fetch_all.call_args_list:
+            sql, params = query_call.args
+            self.assertIn("invest.PortfolioGrants", sql)
+            self.assertIn("pg.RecipientUserId = ?", sql)
+            self.assertIn("pg.RevokedAt IS NULL", sql)
+            self.assertIn("pg.ExpiresAt", sql)
+            self.assertIn("OPENJSON(pg.PermissionsJson)", sql)
+            self.assertIn("[value] = N'VIEW'", sql)
+            self.assertEqual(params, (account_id, recipient_id))
+
+    def test_inaccessible_shared_account_returns_not_found(self) -> None:
+        with patch.object(
+            server,
+            "_current_user_id",
+            return_value="00000000-0000-0000-0000-000000000020",
+        ), patch.object(server, "_fetch_all", return_value=[]) as fetch_all:
+            with self.assertRaisesRegex(ValueError, "Account not found"):
+                server.get_shared_portfolio(
+                    "00000000-0000-0000-0000-000000000010",
+                    object(),
+                )
+
+        fetch_all.assert_called_once()
 
 
 class OrderDurationTests(unittest.TestCase):

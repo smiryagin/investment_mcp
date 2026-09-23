@@ -3871,6 +3871,161 @@ def get_shared_portfolios(ctx: Context) -> list[dict[str, Any]]:
     )
 
 
+@mcp.tool(annotations=READ_ONLY_TOOL)
+def get_shared_portfolio(
+    account_id: str,
+    ctx: Context,
+) -> dict[str, Any]:
+    """Return cash and positions for one account shared with VIEW permission."""
+    user_id = _current_user_id(ctx)
+    normalized_account_id = _canonical_uuid(account_id, "account_id")
+    grant_filter = """
+          AND pg.RevokedAt IS NULL
+          AND (pg.ExpiresAt IS NULL OR pg.ExpiresAt > SYSDATETIMEOFFSET())
+          AND EXISTS
+          (
+              SELECT 1
+              FROM OPENJSON(pg.PermissionsJson)
+              WHERE [value] = N'VIEW'
+          )
+    """
+
+    accounts = _fetch_all(
+        f"""
+        SELECT
+            pg.PortfolioGrantId,
+            a.AccountId,
+            a.AccountName,
+            a.AccountType,
+            a.BaseCurrency,
+            pg.OwnerUserId,
+            owner.DisplayName AS OwnerDisplayName,
+            pg.PermissionsJson,
+            pg.GrantedAt,
+            pg.ExpiresAt,
+            a.RowVersion
+        FROM invest.PortfolioGrants pg
+        JOIN invest.Accounts a
+          ON a.AccountId = pg.AccountId
+         AND a.OwnerUserId = pg.OwnerUserId
+        JOIN invest.Users owner
+          ON owner.UserId = pg.OwnerUserId
+         AND owner.IsActive = 1
+        WHERE pg.AccountId = ?
+          AND pg.RecipientUserId = ?
+          AND a.IsActive = 1
+          {grant_filter}
+        """,
+        (normalized_account_id, user_id),
+    )
+    if not accounts:
+        # Do not reveal whether an inaccessible account exists.
+        raise ValueError("Account not found.")
+
+    balances = _fetch_all(
+        f"""
+        SELECT
+            cb.AccountId,
+            cb.Currency,
+            cb.TotalAmount,
+            cb.AvailableAmount,
+            cb.AsOf,
+            cb.RowVersion
+        FROM invest.CashBalances cb
+        JOIN invest.PortfolioGrants pg
+          ON pg.AccountId = cb.AccountId
+         AND pg.OwnerUserId = cb.UserId
+        JOIN invest.Accounts a
+          ON a.AccountId = pg.AccountId
+         AND a.OwnerUserId = pg.OwnerUserId
+        WHERE pg.AccountId = ?
+          AND pg.RecipientUserId = ?
+          AND a.IsActive = 1
+          {grant_filter}
+        ORDER BY cb.Currency;
+        """,
+        (normalized_account_id, user_id),
+    )
+    positions = _fetch_all(
+        f"""
+        SELECT
+            t.AccountId,
+            t.Symbol,
+            SUM(
+                CASE
+                    WHEN UPPER(t.TransactionType) IN
+                         ('BUY', 'PURCHASE', 'OPENING_POSITION')
+                        THEN COALESCE(t.Quantity, 0)
+                    WHEN UPPER(t.TransactionType) IN ('SELL', 'SALE')
+                        THEN -COALESCE(t.Quantity, 0)
+                    ELSE 0
+                END
+            ) AS Quantity,
+            MAX(t.OccurredAt) AS LastActivityAt,
+            SUM(
+                CASE
+                    WHEN UPPER(t.TransactionType) = 'OPENING_POSITION'
+                        THEN t.GrossAmount
+                    ELSE 0
+                END
+            ) AS OpeningCostBasis,
+            CASE
+                WHEN SUM(
+                    CASE
+                        WHEN UPPER(t.TransactionType) = 'OPENING_POSITION'
+                            THEN COALESCE(t.Quantity, 0)
+                        ELSE 0
+                    END
+                ) = 0 THEN NULL
+                ELSE SUM(
+                    CASE
+                        WHEN UPPER(t.TransactionType) = 'OPENING_POSITION'
+                            THEN t.GrossAmount
+                        ELSE 0
+                    END
+                ) / SUM(
+                    CASE
+                        WHEN UPPER(t.TransactionType) = 'OPENING_POSITION'
+                            THEN COALESCE(t.Quantity, 0)
+                        ELSE 0
+                    END
+                )
+            END AS OpeningAverageCost
+        FROM invest.Transactions t
+        JOIN invest.PortfolioGrants pg
+          ON pg.AccountId = t.AccountId
+         AND pg.OwnerUserId = t.UserId
+        JOIN invest.Accounts a
+          ON a.AccountId = pg.AccountId
+         AND a.OwnerUserId = pg.OwnerUserId
+        WHERE pg.AccountId = ?
+          AND pg.RecipientUserId = ?
+          AND t.IsDeleted = 0
+          AND t.Symbol IS NOT NULL
+          AND a.IsActive = 1
+          {grant_filter}
+        GROUP BY t.AccountId, t.Symbol
+        HAVING SUM(
+            CASE
+                WHEN UPPER(t.TransactionType) IN
+                     ('BUY', 'PURCHASE', 'OPENING_POSITION')
+                    THEN COALESCE(t.Quantity, 0)
+                WHEN UPPER(t.TransactionType) IN ('SELL', 'SALE')
+                    THEN -COALESCE(t.Quantity, 0)
+                ELSE 0
+            END
+        ) <> 0
+        ORDER BY t.Symbol;
+        """,
+        (normalized_account_id, user_id),
+    )
+    return {
+        "accounts": accounts,
+        "cash_balances": balances,
+        "positions": positions,
+    }
+
+
 @mcp.tool(annotations=WRITE_TOOL)
 def share_portfolio(
     account_id: str,
