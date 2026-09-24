@@ -85,6 +85,7 @@ env = { SQLSERVER_CONN = "DRIVER={ODBC Driver 17 for SQL Server};SERVER=localhos
 Global scoring and candidate-review tools:
 
 - `get_reference_universe`
+- `get_fund_holdings`
 - `get_scoring_model`
 - `score_instrument`
 - `rank_candidates`
@@ -147,6 +148,7 @@ Run these in order against the investment database:
 13. `sql/013_add_reference_instrument_classification.sql`
 14. `sql/014_add_investment_scoring.sql`
 15. `sql/015_grant_scoring_runtime.sql`
+16. `sql/016_add_holdings_overlap_and_scoring_v1_1.sql`
 
 The second migration adds idempotency records, order status history, the
 `(UserId, AccountId, ClientOrderId)` uniqueness rule, and soft-deletion fields.
@@ -188,6 +190,11 @@ snapshots, and caller/account-scoped portfolio-fit snapshots. Migration `015`
 grants the runtime access to the safe scoring view and snapshot procedures but
 denies direct scoring-table writes.
 
+Migration `016` corrects value-fund classification (`VTV` becomes
+`LargeValueEquity` while `VBR` and `AVUV` remain `SmallMidFactorEquity`), adds
+version `1.1`, and creates an auditable global fund-holdings snapshot store. The
+MCP runtime can read the latest holdings view but cannot replace holdings.
+
 ## Transparent investment scoring
 
 `invest.McpScoringReferenceInstruments` is the safe global scoring view over
@@ -202,20 +209,54 @@ a disclosed neutral contribution rather than zero; `DataCompletenessScore` and
 
 Without an account, `score_instrument` returns `StandaloneCandidateScore`.
 When a caller-owned `account_id` is supplied, it also returns a portfolio-fit
-score and the configured composite score. Portfolio fit version 1 uses owned
-positions and classification concentration. It explicitly reports that
-fund-holdings overlap and portfolio-return correlation are not yet available.
+score and the configured composite score. Model `1.1` combines classification
+concentration with constituent-level fund overlap and return correlation against
+the owned portfolio. It reports data coverage, observation counts, explicit
+penalties, and source/as-of metadata. If an ETF or mutual fund has no holdings
+snapshot, portfolio fit is capped at `60`; fewer than 60 overlapping return
+observations cap it at `75`. Missing data therefore cannot produce a misleading
+perfect fit score. Holdings older than 45 days cap portfolio fit at `65`.
+When required portfolio-fit data is missing or stale, the composite score is
+also capped at `64`, below the positive-review threshold.
 
 Configure the service with:
 
 ```text
-MCP_SCORING_MODEL_VERSION=1.0
+MCP_SCORING_MODEL_VERSION=1.1
 MCP_SCORING_BENCHMARK=VOO
 MCP_SCORING_MIN_PEER_COUNT=5
 MCP_SCORING_MAX_CANDIDATES=10
 MCP_SCORING_DEFAULT_TARGET_WEIGHT_PERCENT=2
 MCP_SCORING_PERSIST_SNAPSHOTS=true
 ```
+
+Schwab quote/fundamental responses used by this project do not include complete
+fund constituents. Load normalized issuer or licensed-provider exports through
+the dedicated data-loader procedure. Add an administrative database user to the
+role once:
+
+```sql
+ALTER ROLE investment_data_loader ADD MEMBER [investment_holdings_loader];
+```
+
+Create a CSV with these columns (one row per constituent):
+
+```text
+FundSymbol,AsOfDate,SourceName,SourceUrl,HoldingKey,HoldingSymbol,HoldingName,WeightPercent,ReportedCoveragePercent,IsComplete
+```
+
+`HoldingKey` may be omitted when `HoldingSymbol` is present; the importer creates
+`TICKER:<symbol>`. Use `CUSIP:<cusip>` when a provider does not supply a ticker.
+Set a separate loader connection and import the provider file:
+
+```powershell
+$env:HOLDINGS_SQLSERVER_CONN = 'DRIVER={ODBC Driver 17 for SQL Server};SERVER=...;DATABASE=Trade;UID=investment_holdings_loader;PWD=...;Encrypt=yes;TrustServerCertificate=yes;'
+.\.venv\Scripts\python.exe .\scripts\import_fund_holdings.py .\data\fund-holdings.csv
+```
+
+Do not add `mcp_connector` to `investment_data_loader`. Use
+`get_fund_holdings(symbol)` to audit exactly which latest snapshot influences a
+score.
 
 After the daily price-data load, refresh shared scores from the server project
 directory with:
@@ -226,8 +267,9 @@ $env:MCP_SCORING_REFRESH_AUTH_SUBJECT = 'local:andreySr'
 ```
 
 This can later run as a Windows Scheduled Task. Deploy `server.py`, the complete
-`scoring` directory, and `scripts/refresh_scoring.py`; copying only `server.py`
-is no longer sufficient.
+`scoring` directory, `scripts/refresh_scoring.py`, and
+`scripts/import_fund_holdings.py`; copying only `server.py` is no longer
+sufficient.
 
 ## Schwab OAuth access-token refresh
 

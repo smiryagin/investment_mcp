@@ -159,7 +159,12 @@ SCHWAB_MAX_CONCURRENT_REQUESTS = int(
 )
 SCHWAB_MAX_QUOTE_SYMBOLS = int(os.getenv("SCHWAB_MAX_QUOTE_SYMBOLS", "200"))
 
-SCORING_MODEL_VERSION = os.getenv("MCP_SCORING_MODEL_VERSION", "1.0").strip()
+SCORING_MODEL_VERSION = os.getenv("MCP_SCORING_MODEL_VERSION", "1.1").strip()
+if SCORING_MODEL_VERSION != "1.1":
+    raise RuntimeError(
+        "This server build implements scoring model 1.1; set "
+        "MCP_SCORING_MODEL_VERSION=1.1."
+    )
 SCORING_BENCHMARK = _cleaned_scoring_benchmark = os.getenv(
     "MCP_SCORING_BENCHMARK",
     "VOO",
@@ -2153,6 +2158,42 @@ def _load_scoring_reference_rows() -> list[dict[str, Any]]:
     return merged_rows
 
 
+def _load_latest_fund_holdings() -> dict[str, dict[str, Any]]:
+    """Load the latest provider-neutral fund holdings used for overlap scoring."""
+    rows = _fetch_all(
+        """
+        SELECT
+            FundSymbol,
+            HoldingKey,
+            HoldingSymbol,
+            WeightPercent,
+            AsOfDate,
+            SourceName,
+            ReportedCoveragePercent
+        FROM invest.McpLatestFundHoldings
+        ORDER BY FundSymbol, WeightPercent DESC, HoldingKey;
+        """
+    )
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        fund_symbol = str(row.get("FundSymbol") or "").upper()
+        holding_key = str(row.get("HoldingKey") or "").upper()
+        weight_percent = _number(row.get("WeightPercent"))
+        if not fund_symbol or not holding_key or weight_percent is None:
+            continue
+        entry = result.setdefault(
+            fund_symbol,
+            {
+                "AsOfDate": row.get("AsOfDate"),
+                "SourceName": row.get("SourceName"),
+                "CoveragePercent": _number(row.get("ReportedCoveragePercent")),
+                "Holdings": {},
+            },
+        )
+        entry["Holdings"][holding_key] = max(0.0, weight_percent) / 100.0
+    return result
+
+
 def _load_scoring_history(
     symbol: str,
     user_id: str,
@@ -2217,7 +2258,7 @@ def _prepare_scoring_candidate(
     reference_rows: list[dict[str, Any]],
     score_as_of: date,
     benchmark_history: list[dict[str, Any]],
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     local = next(
         (
             dict(row)
@@ -2260,7 +2301,7 @@ def _prepare_scoring_candidate(
     candidate.update(price_features)
     candidate["Symbol"] = symbol
     candidate["HistorySource"] = history[0].get("Source") if history else None
-    return candidate, price_features
+    return candidate, price_features, history
 
 
 def _owned_scoring_positions(
@@ -2327,6 +2368,42 @@ def _owned_scoring_positions(
         price = price_by_symbol.get(symbol)
         position["MarketValue"] = quantity * price if price is not None else None
     return positions
+
+
+def _load_position_histories(
+    positions: list[dict[str, Any]],
+    as_of: date,
+) -> dict[str, list[dict[str, Any]]]:
+    """Bulk-load local histories for portfolio correlation without Schwab calls."""
+    symbols = _clean_symbols(
+        [str(position.get("Symbol") or "") for position in positions]
+    )
+    if not symbols:
+        return {}
+    start_date = as_of - timedelta(days=365 * 4)
+    placeholders = ",".join("?" for _ in symbols)
+    rows = _fetch_all(
+        f"""
+        SELECT
+            instrument.Symbol,
+            history.Date,
+            history.LastValue
+        FROM dbo.SeriesData AS history
+        INNER JOIN invest.McpInstruments AS instrument
+            ON instrument.SeriesId = history.SeriesId
+        WHERE UPPER(instrument.Symbol) IN ({placeholders})
+          AND history.Date >= ?
+          AND history.Date <= ?
+        ORDER BY instrument.Symbol, history.Date;
+        """,
+        (*symbols, start_date, as_of),
+    )
+    histories: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        symbol = str(row.get("Symbol") or "").upper()
+        if symbol:
+            histories.setdefault(symbol, []).append(row)
+    return histories
 
 
 def _persist_scoring_snapshot(
@@ -2498,8 +2575,10 @@ def _score_symbol_for_user(
     target_weight_percent: float,
     score_as_of: date,
     owned_positions: list[dict[str, Any]] | None = None,
+    fund_holdings: dict[str, dict[str, Any]] | None = None,
+    position_histories: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
-    candidate, price_features = _prepare_scoring_candidate(
+    candidate, price_features, candidate_history = _prepare_scoring_candidate(
         symbol,
         user_id,
         reference_rows,
@@ -2526,11 +2605,22 @@ def _score_symbol_for_user(
         if owned_positions is not None
         else _owned_scoring_positions(user_id, account_id, reference_rows)
     )
+    loaded_fund_holdings = (
+        fund_holdings if fund_holdings is not None else _load_latest_fund_holdings()
+    )
+    loaded_position_histories = (
+        position_histories
+        if position_histories is not None
+        else _load_position_histories(positions, score_as_of)
+    )
     portfolio_fit = compute_portfolio_fit(
         score,
         positions,
         reference_rows,
         target_weight_percent=target_weight_percent,
+        fund_holdings=loaded_fund_holdings,
+        candidate_history=candidate_history,
+        position_histories=loaded_position_histories,
     )
     similarity = score["ReferenceSimilarityScore"]
     similarity_for_formula = similarity if similarity is not None else 50.0
@@ -2545,6 +2635,8 @@ def _score_symbol_for_user(
     if score["RiskScore"] < 25:
         composite = min(composite, 69.0)
     if score["LiquidityCostScore"] < 20:
+        composite = min(composite, 64.0)
+    if portfolio_fit["PortfolioFitDataStatus"] != "Sufficient":
         composite = min(composite, 64.0)
     score["AccountId"] = account_id
     score["PortfolioFitScore"] = portfolio_fit["PortfolioFitScore"]
@@ -3207,6 +3299,36 @@ def get_reference_universe(
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL)
+def get_fund_holdings(
+    symbol: str,
+    ctx: Context,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Return the latest normalized holdings snapshot used for overlap scoring."""
+    _current_user_id(ctx)
+    cleaned_symbol = _clean_symbol(symbol)
+    normalized_limit = _clamp_limit(limit, default=100)
+    return _fetch_all(
+        f"""
+        SELECT TOP ({normalized_limit})
+            FundSymbol,
+            HoldingKey,
+            HoldingSymbol,
+            HoldingName,
+            WeightPercent,
+            AsOfDate,
+            SourceName,
+            SourceUrl,
+            ReportedCoveragePercent
+        FROM invest.McpLatestFundHoldings
+        WHERE FundSymbol = ?
+        ORDER BY WeightPercent DESC, HoldingKey;
+        """,
+        (cleaned_symbol,),
+    )
+
+
+@mcp.tool(annotations=READ_ONLY_TOOL)
 def get_scoring_model(
     ctx: Context,
     model_version: str | None = None,
@@ -3316,6 +3438,12 @@ def rank_candidates(
         if normalized_account_id
         else None
     )
+    fund_holdings = _load_latest_fund_holdings() if normalized_account_id else None
+    position_histories = (
+        _load_position_histories(owned_positions or [], score_as_of)
+        if normalized_account_id
+        else None
+    )
     scored: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     for cleaned_symbol in cleaned_symbols:
@@ -3330,6 +3458,8 @@ def rank_candidates(
                     target_weight_percent=normalized_target_weight,
                     score_as_of=score_as_of,
                     owned_positions=owned_positions,
+                    fund_holdings=fund_holdings,
+                    position_histories=position_histories,
                 )
             )
         except (ValueError, SchwabApiError, RateLimitExceeded) as exc:
@@ -4932,6 +5062,13 @@ invest.McpScoringReferenceInstruments and scoring snapshots:
   assigns transparent candidate classes and archetypes without changing the
   existing symbol-management application. Global feature/score snapshots are
   shared; portfolio-fit snapshots are restricted to the authenticated owner.
+
+invest.McpLatestFundHoldings:
+  Latest normalized provider holdings for each fund. Model 1.1 combines this
+  global read-only dataset with local price history to measure constituent
+  overlap and portfolio-return correlation. Missing holdings and insufficient
+  correlation history impose explicit score caps rather than assuming a
+  perfect portfolio fit.
 
 Schwab market data:
   Read-only quotes, instrument profiles, daily price history, market hours,

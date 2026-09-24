@@ -65,6 +65,26 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(result["Archetype"], "Unclassified")
         self.assertTrue(result["NeedsReview"])
 
+    def test_large_value_is_not_misclassified_as_small_mid_value(self) -> None:
+        large_value = classify_instrument(
+            {
+                "Symbol": "VTV",
+                "Name": "Vanguard Value ETF",
+                "AssetType": "ETF",
+            }
+        )
+        small_value = classify_instrument(
+            {
+                "Symbol": "VBR",
+                "Name": "Vanguard Small-Cap Value ETF",
+                "AssetType": "ETF",
+            }
+        )
+
+        self.assertEqual(large_value["Archetype"], "LargeValueEquity")
+        self.assertEqual(small_value["Archetype"], "SmallMidFactorEquity")
+        self.assertEqual(large_value["ClassificationRuleVersion"], "2")
+
 
 class PriceFeatureTests(unittest.TestCase):
     def test_as_of_filter_prevents_future_price_lookahead(self) -> None:
@@ -157,9 +177,9 @@ class TransparentScoreTests(unittest.TestCase):
         )
         new_asset = compute_portfolio_fit(
             {
-                "Symbol": "VXUS",
-                "CandidateClass": "ETF",
-                "Archetype": "InternationalEquity",
+                "Symbol": "GOOGL",
+                "CandidateClass": "Stock",
+                "Archetype": "IndividualStock",
             },
             [{"Symbol": "MSFT", "MarketValue": 100}],
             references,
@@ -169,6 +189,118 @@ class TransparentScoreTests(unittest.TestCase):
             duplicate["PortfolioFitScore"],
             new_asset["PortfolioFitScore"],
         )
+
+    def test_missing_fund_holdings_cap_portfolio_fit(self) -> None:
+        result = compute_portfolio_fit(
+            {
+                "Symbol": "VTV",
+                "CandidateClass": "ETF",
+                "Archetype": "LargeValueEquity",
+            },
+            [{"Symbol": "MSFT", "MarketValue": 100}],
+            [_peer("MSFT")],
+        )
+
+        self.assertEqual(result["HoldingsOverlapStatus"], "Unavailable")
+        self.assertEqual(result["PortfolioFitDataStatus"], "Incomplete")
+        self.assertLessEqual(result["PortfolioFitScore"], 60)
+        self.assertTrue(any("capped at 60" in item for item in result["Limitations"]))
+
+    def test_fund_overlap_reduces_portfolio_fit(self) -> None:
+        references = [
+            {
+                "Symbol": "VOO",
+                "CandidateClass": "ETF",
+                "Archetype": "BroadUSEquity",
+            }
+        ]
+        positions = [{"Symbol": "VOO", "MarketValue": 100}]
+        holdings = {
+            "VOO": {
+                "CoveragePercent": 100,
+                "Holdings": {"TICKER:A": 0.50, "TICKER:C": 0.50},
+            },
+            "VTV": {
+                "CoveragePercent": 100,
+                "Holdings": {"TICKER:A": 0.60, "TICKER:B": 0.40},
+            },
+            "VXUS": {
+                "CoveragePercent": 100,
+                "Holdings": {"TICKER:X": 0.50, "TICKER:Y": 0.50},
+            },
+        }
+        overlapping = compute_portfolio_fit(
+            {
+                "Symbol": "VTV",
+                "CandidateClass": "ETF",
+                "Archetype": "LargeValueEquity",
+            },
+            positions,
+            references,
+            fund_holdings=holdings,
+        )
+        diversifying = compute_portfolio_fit(
+            {
+                "Symbol": "VXUS",
+                "CandidateClass": "ETF",
+                "Archetype": "InternationalEquity",
+            },
+            positions,
+            references,
+            fund_holdings=holdings,
+        )
+
+        self.assertEqual(overlapping["HoldingsOverlapPercent"], 50.0)
+        self.assertGreater(overlapping["HoldingsOverlapPenalty"], 0)
+        self.assertLess(
+            overlapping["PortfolioFitScore"],
+            diversifying["PortfolioFitScore"],
+        )
+
+    def test_stale_holdings_cap_portfolio_fit(self) -> None:
+        result = compute_portfolio_fit(
+            {
+                "Symbol": "VTV",
+                "CandidateClass": "ETF",
+                "Archetype": "LargeValueEquity",
+                "ScoreAsOf": "2026-09-24",
+            },
+            [{"Symbol": "MSFT", "MarketValue": 100}],
+            [_peer("MSFT")],
+            fund_holdings={
+                "VTV": {
+                    "AsOfDate": "2026-01-01",
+                    "CoveragePercent": 100,
+                    "Holdings": {"TICKER:MSFT": 0.05},
+                }
+            },
+        )
+
+        self.assertEqual(result["HoldingsOverlapStatus"], "Stale")
+        self.assertLessEqual(result["PortfolioFitScore"], 65)
+        self.assertTrue(any("45 days" in item for item in result["Limitations"]))
+
+    def test_return_correlation_is_measured_and_penalized(self) -> None:
+        start = date(2026, 1, 1)
+        history = [
+            {"Date": start + timedelta(days=index), "LastValue": 100 + index ** 1.2}
+            for index in range(100)
+        ]
+        result = compute_portfolio_fit(
+            {
+                "Symbol": "NEW",
+                "CandidateClass": "Stock",
+                "Archetype": "IndividualStock",
+            },
+            [{"Symbol": "MSFT", "MarketValue": 100}],
+            [_peer("MSFT")],
+            candidate_history=history,
+            position_histories={"MSFT": history},
+        )
+
+        self.assertEqual(result["CorrelationObservationCount"], 99)
+        self.assertAlmostEqual(result["ReturnCorrelation"], 1.0)
+        self.assertGreater(result["CorrelationPenalty"], 0)
 
 
 class ScoringMigrationTests(unittest.TestCase):
@@ -196,12 +328,30 @@ class ScoringMigrationTests(unittest.TestCase):
         self.assertIn("UpsertPortfolioCandidateScoreSnapshot", sql)
         self.assertIn("DENY INSERT, UPDATE, DELETE", sql)
 
+    def test_holdings_migration_is_read_only_for_mcp_runtime(self) -> None:
+        sql = (
+            ROOT / "sql" / "016_add_holdings_overlap_and_scoring_v1_1.sql"
+        ).read_text(encoding="utf-8")
+        self.assertIn("LargeValueEquity", sql)
+        self.assertIn("invest.McpLatestFundHoldings", sql)
+        self.assertIn("invest.ReplaceFundHoldingsSnapshot", sql)
+        self.assertIn("investment_data_loader", sql)
+        self.assertIn("TO [mcp_connector]", sql)
+        self.assertIn("DENY INSERT, UPDATE, DELETE", sql)
+        self.assertNotIn(
+            "GRANT EXECUTE ON OBJECT::invest.ReplaceFundHoldingsSnapshot\n"
+            "        TO [mcp_connector]",
+            sql,
+        )
+        self.assertIn("'1.1'", sql)
+
 
 class ScoringToolTests(unittest.TestCase):
     def test_read_only_scoring_tools_are_registered(self) -> None:
         registered = server.mcp._tool_manager._tools
         expected = {
             "get_reference_universe",
+            "get_fund_holdings",
             "get_scoring_model",
             "score_instrument",
             "rank_candidates",
@@ -263,7 +413,7 @@ class ScoringToolTests(unittest.TestCase):
             "_schwab_cached_market_data_get",
             side_effect=[quote_payload, history_payload],
         ) as market_get:
-            candidate, features = server._prepare_scoring_candidate(
+            candidate, features, history = server._prepare_scoring_candidate(
                 "IWM",
                 "user-id",
                 [],
@@ -273,6 +423,7 @@ class ScoringToolTests(unittest.TestCase):
 
         self.assertEqual(candidate["CandidateClass"], "ETF")
         self.assertEqual(features["PriceDate"], (start + timedelta(days=259)).isoformat())
+        self.assertEqual(len(history), 260)
         self.assertEqual(market_get.call_args_list[0].args[0], "/quotes")
         self.assertEqual(market_get.call_args_list[1].args[0], "/pricehistory")
         self.assertEqual(market_get.call_args_list[0].kwargs["units"], 1)

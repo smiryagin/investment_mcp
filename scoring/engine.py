@@ -14,7 +14,7 @@ from datetime import date, datetime
 from typing import Any
 
 
-SCORING_RULE_VERSION = "1"
+SCORING_RULE_VERSION = "2"
 
 
 def _number(value: Any) -> float | None:
@@ -41,6 +41,7 @@ def _upper(row: Mapping[str, Any], *names: str) -> str:
 
 def classify_instrument(row: Mapping[str, Any]) -> dict[str, Any]:
     """Classify an instrument using deterministic, explainable text rules."""
+    symbol = str(row.get("Symbol") or "").strip().upper()
     type_text = _upper(row, "Type", "AssetType", "AssetSubType")
     descriptive_text = _upper(
         row,
@@ -84,7 +85,7 @@ def classify_instrument(row: Mapping[str, Any]) -> dict[str, Any]:
             confidence = 0.90
         elif any(
             value in descriptive_text
-            for value in ("SMALL CAP", "SMALL-CAP", "MID CAP", "MID-CAP", "VALUE")
+            for value in ("SMALL CAP", "SMALL-CAP", "MID CAP", "MID-CAP")
         ):
             archetype = "SmallMidFactorEquity"
             confidence = 0.86
@@ -97,6 +98,15 @@ def classify_instrument(row: Mapping[str, Any]) -> dict[str, Any]:
         elif "GROWTH" in descriptive_text:
             archetype = "GrowthEquityFund"
             confidence = 0.84
+        elif symbol in {"VTV", "SCHV", "IWD", "IVE"} or (
+            "VALUE" in descriptive_text
+            and any(value in descriptive_text for value in ("LARGE CAP", "LARGE-CAP"))
+        ):
+            archetype = "LargeValueEquity"
+            confidence = 0.90
+        elif "VALUE" in descriptive_text:
+            archetype = "ValueEquityFund"
+            confidence = 0.78
         elif any(
             value in descriptive_text
             for value in ("S&P 500", "TOTAL STOCK", "TOTAL MARKET", "BROAD MARKET", "LARGE CAP")
@@ -509,7 +519,7 @@ def score_candidate(
     candidate: Mapping[str, Any],
     reference_rows: Sequence[Mapping[str, Any]],
     *,
-    model_version: str = "1.0",
+    model_version: str = "1.1",
     score_as_of: date | None = None,
     minimum_peer_count: int = 5,
 ) -> dict[str, Any]:
@@ -643,18 +653,279 @@ def score_candidate(
     }
 
 
+def _weighted_positions(
+    positions: Sequence[Mapping[str, Any]],
+) -> list[tuple[Mapping[str, Any], float]]:
+    weighted: list[tuple[Mapping[str, Any], float]] = []
+    for position in positions:
+        weight_value = _number(position.get("MarketValue"))
+        if weight_value is None:
+            weight_value = abs(_number(position.get("Quantity")) or 0.0)
+        if weight_value > 0:
+            weighted.append((position, weight_value))
+    total = sum(value for _, value in weighted)
+    if total <= 0 and positions:
+        return [(position, 1.0 / len(positions)) for position in positions]
+    return [(position, value / total) for position, value in weighted]
+
+
+def _normalized_holding_map(info: Mapping[str, Any] | None) -> dict[str, float]:
+    if not info:
+        return {}
+    raw_holdings = info.get("Holdings")
+    if not isinstance(raw_holdings, Mapping):
+        return {}
+    normalized: dict[str, float] = {}
+    for raw_key, raw_weight in raw_holdings.items():
+        key = str(raw_key or "").strip().upper()
+        weight = _number(raw_weight)
+        if not key or weight is None or weight <= 0:
+            continue
+        if weight > 1:
+            weight /= 100.0
+        normalized[key] = min(1.0, weight)
+    return normalized
+
+
+def _holding_age_days(
+    info: Mapping[str, Any] | None,
+    evaluation_date: date,
+) -> int | None:
+    if not info:
+        return None
+    as_of = _date_value(info.get("AsOfDate"))
+    if as_of is None:
+        return None
+    return max(0, (evaluation_date - as_of).days)
+
+
+def _holdings_overlap(
+    candidate: Mapping[str, Any],
+    weighted_positions: Sequence[tuple[Mapping[str, Any], float]],
+    classifications: Mapping[str, Mapping[str, Any]],
+    fund_holdings: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    candidate_symbol = str(candidate.get("Symbol") or "").upper()
+    candidate_class = str(candidate.get("CandidateClass") or "")
+    fund_classes = {"ETF", "MutualFund"}
+    evaluation_date = _date_value(candidate.get("ScoreAsOf")) or date.today()
+    candidate_info = fund_holdings.get(candidate_symbol)
+    candidate_holdings = _normalized_holding_map(candidate_info)
+    candidate_age_days = _holding_age_days(candidate_info, evaluation_date)
+    candidate_is_stale = (
+        candidate_age_days is not None and candidate_age_days > 45
+    )
+    candidate_coverage = _number(
+        candidate_info.get("CoveragePercent") if candidate_info else None
+    )
+    if candidate_holdings and candidate_coverage is None:
+        candidate_coverage = sum(candidate_holdings.values()) * 100.0
+    candidate_coverage = max(0.0, min(100.0, candidate_coverage or 0.0))
+
+    if not weighted_positions:
+        return {
+            "HoldingsOverlapStatus": "EmptyPortfolio",
+            "HoldingsOverlapPercent": 0.0,
+            "HoldingsDataCoveragePercent": 100.0,
+            "CandidateHoldingsAsOf": (
+                candidate_info.get("AsOfDate") if candidate_info else None
+            ),
+            "CandidateHoldingsSource": (
+                candidate_info.get("SourceName") if candidate_info else None
+            ),
+            "CandidateHoldingsAgeDays": candidate_age_days,
+        }
+
+    if candidate_class in fund_classes and not candidate_holdings:
+        return {
+            "HoldingsOverlapStatus": "Unavailable",
+            "HoldingsOverlapPercent": None,
+            "HoldingsDataCoveragePercent": 0.0,
+            "CandidateHoldingsAsOf": None,
+            "CandidateHoldingsSource": None,
+            "CandidateHoldingsAgeDays": None,
+        }
+
+    if candidate_class not in fund_classes | {"Stock"}:
+        return {
+            "HoldingsOverlapStatus": "NotApplicable",
+            "HoldingsOverlapPercent": None,
+            "HoldingsDataCoveragePercent": 100.0,
+            "CandidateHoldingsAsOf": None,
+            "CandidateHoldingsSource": None,
+            "CandidateHoldingsAgeDays": None,
+        }
+
+    overlap = 0.0
+    measured_weight = 0.0
+    for position, position_weight in weighted_positions:
+        position_symbol = str(position.get("Symbol") or "").upper()
+        if not position_symbol:
+            continue
+        if position_symbol == candidate_symbol:
+            overlap += position_weight
+            measured_weight += position_weight
+            continue
+
+        position_classification = classifications.get(position_symbol) or {}
+        position_class = str(position_classification.get("CandidateClass") or "")
+        position_info = fund_holdings.get(position_symbol)
+        position_holdings = _normalized_holding_map(position_info)
+        position_age_days = _holding_age_days(position_info, evaluation_date)
+        if position_age_days is not None and position_age_days > 45:
+            position_holdings = {}
+
+        if candidate_class in fund_classes:
+            if position_holdings:
+                pair_overlap = sum(
+                    min(weight, position_holdings.get(key, 0.0))
+                    for key, weight in candidate_holdings.items()
+                )
+            elif position_class == "Stock":
+                pair_overlap = candidate_holdings.get(
+                    f"TICKER:{position_symbol}",
+                    candidate_holdings.get(position_symbol, 0.0),
+                )
+            else:
+                continue
+        else:
+            if position_holdings:
+                pair_overlap = position_holdings.get(
+                    f"TICKER:{candidate_symbol}",
+                    position_holdings.get(candidate_symbol, 0.0),
+                )
+            elif position_class == "Stock":
+                pair_overlap = 0.0
+            else:
+                continue
+
+        overlap += position_weight * min(1.0, max(0.0, pair_overlap))
+        measured_weight += position_weight
+
+    data_coverage = measured_weight
+    if candidate_class in fund_classes:
+        data_coverage *= candidate_coverage / 100.0
+    if candidate_is_stale:
+        status = "Stale"
+    else:
+        status = "Available" if data_coverage >= 0.999 else "Partial"
+    return {
+        "HoldingsOverlapStatus": status,
+        "HoldingsOverlapPercent": round(overlap * 100.0, 2),
+        "HoldingsDataCoveragePercent": round(data_coverage * 100.0, 2),
+        "CandidateHoldingsAsOf": (
+            candidate_info.get("AsOfDate") if candidate_info else None
+        ),
+        "CandidateHoldingsSource": (
+            candidate_info.get("SourceName") if candidate_info else None
+        ),
+        "CandidateHoldingsAgeDays": candidate_age_days,
+    }
+
+
+def _dated_returns(history: Sequence[Mapping[str, Any]]) -> dict[date, float]:
+    closes: dict[date, float] = {}
+    for row in history:
+        day = _date_value(row.get("Date") or row.get("datetime"))
+        close = _number(
+            row.get("LastValue")
+            if row.get("LastValue") is not None
+            else row.get("close")
+        )
+        if day is not None and close is not None and close > 0:
+            closes[day] = close
+    returns: dict[date, float] = {}
+    previous: float | None = None
+    for day, close in sorted(closes.items()):
+        if previous is not None and previous > 0:
+            returns[day] = close / previous - 1.0
+        previous = close
+    return returns
+
+
+def _portfolio_return_correlation(
+    candidate_history: Sequence[Mapping[str, Any]],
+    weighted_positions: Sequence[tuple[Mapping[str, Any], float]],
+    position_histories: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    minimum_observations: int = 60,
+) -> dict[str, Any]:
+    if not weighted_positions:
+        return {
+            "ReturnCorrelation": None,
+            "CorrelationObservationCount": 0,
+            "CorrelationDataCoveragePercent": 100.0,
+        }
+    candidate_returns = _dated_returns(candidate_history)
+    position_returns = {
+        symbol: _dated_returns(history)
+        for symbol, history in position_histories.items()
+    }
+    candidate_values: list[float] = []
+    portfolio_values: list[float] = []
+    coverage_values: list[float] = []
+    for day, candidate_return in candidate_returns.items():
+        weighted_return = 0.0
+        available_weight = 0.0
+        for position, position_weight in weighted_positions:
+            symbol = str(position.get("Symbol") or "").upper()
+            value = position_returns.get(symbol, {}).get(day)
+            if value is None:
+                continue
+            weighted_return += position_weight * value
+            available_weight += position_weight
+        if available_weight < 0.50:
+            continue
+        candidate_values.append(candidate_return)
+        portfolio_values.append(weighted_return / available_weight)
+        coverage_values.append(available_weight)
+
+    observations = len(candidate_values)
+    coverage = (
+        statistics.fmean(coverage_values) * 100.0 if coverage_values else 0.0
+    )
+    if observations < minimum_observations:
+        return {
+            "ReturnCorrelation": None,
+            "CorrelationObservationCount": observations,
+            "CorrelationDataCoveragePercent": round(coverage, 2),
+        }
+    candidate_mean = statistics.fmean(candidate_values)
+    portfolio_mean = statistics.fmean(portfolio_values)
+    covariance = sum(
+        (candidate - candidate_mean) * (portfolio - portfolio_mean)
+        for candidate, portfolio in zip(candidate_values, portfolio_values)
+    )
+    candidate_variance = sum(
+        (candidate - candidate_mean) ** 2 for candidate in candidate_values
+    )
+    portfolio_variance = sum(
+        (portfolio - portfolio_mean) ** 2 for portfolio in portfolio_values
+    )
+    denominator = math.sqrt(candidate_variance * portfolio_variance)
+    correlation = covariance / denominator if denominator > 0 else None
+    return {
+        "ReturnCorrelation": (
+            round(max(-1.0, min(1.0, correlation)), 4)
+            if correlation is not None
+            else None
+        ),
+        "CorrelationObservationCount": observations,
+        "CorrelationDataCoveragePercent": round(coverage, 2),
+    }
+
+
 def compute_portfolio_fit(
     candidate: Mapping[str, Any],
     positions: Sequence[Mapping[str, Any]],
     reference_rows: Sequence[Mapping[str, Any]],
     *,
     target_weight_percent: float = 2.0,
+    fund_holdings: Mapping[str, Mapping[str, Any]] | None = None,
+    candidate_history: Sequence[Mapping[str, Any]] | None = None,
+    position_histories: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
 ) -> dict[str, Any]:
-    """Estimate portfolio fit using owned positions and global classifications.
-
-    Version 1 deliberately uses classification concentration rather than
-    pretending that fund-level holdings overlap is available.
-    """
+    """Estimate portfolio fit with classification, holdings, and correlation data."""
     target_weight = min(25.0, max(0.01, float(target_weight_percent))) / 100.0
     candidate_symbol = str(candidate.get("Symbol") or "").upper()
     candidate_class = candidate.get("CandidateClass")
@@ -663,24 +934,13 @@ def compute_portfolio_fit(
         str(row.get("Symbol") or "").upper(): row for row in reference_rows
     }
 
-    weighted_positions: list[tuple[Mapping[str, Any], float]] = []
-    for position in positions:
-        weight_value = _number(position.get("MarketValue"))
-        if weight_value is None:
-            weight_value = abs(_number(position.get("Quantity")) or 0.0)
-        if weight_value > 0:
-            weighted_positions.append((position, weight_value))
-    total_weight_value = sum(value for _, value in weighted_positions)
-    if total_weight_value == 0 and positions:
-        weighted_positions = [(position, 1.0) for position in positions]
-        total_weight_value = float(len(weighted_positions))
+    weighted_positions = _weighted_positions(positions)
 
     existing_symbol_weight = 0.0
     archetype_weight = 0.0
     class_weight = 0.0
     classified_weight = 0.0
-    for position, raw_weight in weighted_positions:
-        position_weight = raw_weight / total_weight_value if total_weight_value else 0.0
+    for position, position_weight in weighted_positions:
         symbol = str(position.get("Symbol") or "").upper()
         if symbol == candidate_symbol:
             existing_symbol_weight += position_weight
@@ -700,9 +960,91 @@ def compute_portfolio_fit(
         score -= 35.0
     score -= min(40.0, max(0.0, after_archetype - 0.25) * 100.0)
     score -= min(20.0, max(0.0, after_class - 0.70) * 100.0)
+
+    holdings_result = _holdings_overlap(
+        candidate,
+        weighted_positions,
+        classifications,
+        fund_holdings or {},
+    )
+    holdings_overlap = _number(holdings_result.get("HoldingsOverlapPercent"))
+    holdings_penalty = (
+        min(50.0, holdings_overlap * 0.75)
+        if holdings_overlap is not None
+        else 0.0
+    )
+    score -= holdings_penalty
+
+    correlation_result = _portfolio_return_correlation(
+        candidate_history or [],
+        weighted_positions,
+        position_histories or {},
+    )
+    correlation = _number(correlation_result.get("ReturnCorrelation"))
+    correlation_penalty = (
+        min(20.0, max(0.0, correlation - 0.40) * 30.0)
+        if correlation is not None
+        else 0.0
+    )
+    score -= correlation_penalty
+
+    limitations: list[str] = []
+    fit_data_incomplete = False
+    holdings_status = holdings_result["HoldingsOverlapStatus"]
+    holdings_coverage = _number(
+        holdings_result.get("HoldingsDataCoveragePercent")
+    ) or 0.0
+    if weighted_positions and holdings_status == "Unavailable":
+        fit_data_incomplete = True
+        score = min(score, 60.0)
+        limitations.append(
+            "Fund holdings are unavailable; portfolio fit is capped at 60."
+        )
+    elif weighted_positions and holdings_status == "Stale":
+        fit_data_incomplete = True
+        score = min(score, 65.0)
+        limitations.append(
+            "Fund holdings are more than 45 days old; portfolio fit is capped at 65."
+        )
+    elif weighted_positions and holdings_status == "Partial" and holdings_coverage < 70:
+        fit_data_incomplete = True
+        score = min(score, 70.0)
+        limitations.append(
+            "Fund holdings coverage is below 70%; portfolio fit is capped at 70."
+        )
+    if holdings_overlap is not None and holdings_overlap >= 20:
+        limitations.append(
+            f"Estimated constituent overlap is {holdings_overlap:.2f}% and reduces portfolio fit."
+        )
+    if weighted_positions and correlation is None:
+        fit_data_incomplete = True
+        score = min(score, 75.0)
+        limitations.append(
+            "Return correlation has fewer than 60 overlapping observations; "
+            "portfolio fit is capped at 75."
+        )
+    elif correlation is not None and correlation >= 0.75:
+        limitations.append(
+            f"Return correlation is {correlation:.2f} and reduces portfolio fit."
+        )
+    if fit_data_incomplete:
+        limitations.append(
+            "Composite score is prevented from entering a positive review tier until portfolio-fit data is sufficient."
+        )
     score = round(max(0.0, min(100.0, score)), 2)
     classification_coverage = (
         round(classified_weight * 100.0, 2) if positions else 100.0
+    )
+    completeness_inputs: list[float] = []
+    if holdings_status != "NotApplicable":
+        completeness_inputs.append(holdings_coverage)
+    completeness_inputs.append(
+        _number(correlation_result.get("CorrelationDataCoveragePercent")) or 0.0
+    )
+    fit_completeness = (
+        round(statistics.fmean(completeness_inputs), 2)
+        if completeness_inputs
+        else 100.0
     )
     return {
         "PortfolioFitScore": score,
@@ -713,8 +1055,13 @@ def compute_portfolio_fit(
         "ExistingClassWeightPercent": round(class_weight * 100.0, 2),
         "ProjectedClassWeightPercent": round(after_class * 100.0, 2),
         "ClassificationCoveragePercent": classification_coverage,
-        "Limitations": [
-            "Detailed fund-holdings overlap is not yet available.",
-            "Return-correlation impact is not included in portfolio-fit version 1.",
-        ],
+        **holdings_result,
+        "HoldingsOverlapPenalty": round(holdings_penalty, 2),
+        **correlation_result,
+        "CorrelationPenalty": round(correlation_penalty, 2),
+        "FitDataCompletenessScore": fit_completeness,
+        "PortfolioFitDataStatus": (
+            "Incomplete" if fit_data_incomplete else "Sufficient"
+        ),
+        "Limitations": limitations,
     }

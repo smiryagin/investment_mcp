@@ -128,7 +128,6 @@ BEGIN
               OR @DescriptionText LIKE N'%SMALL-CAP%'
               OR @DescriptionText LIKE N'%MID CAP%'
               OR @DescriptionText LIKE N'%MID-CAP%'
-              OR @DescriptionText LIKE N'% VALUE %'
                 THEN 'SmallMidFactorEquity'
             WHEN @DescriptionText LIKE N'%TECHNOLOGY%'
               OR @DescriptionText LIKE N'%SEMICONDUCTOR%'
@@ -138,6 +137,20 @@ BEGIN
                 THEN 'SectorEquity'
             WHEN @DescriptionText LIKE N'% GROWTH %'
                 THEN 'GrowthEquityFund'
+            WHEN UPPER(LTRIM(RTRIM(COALESCE(@Symbol, N'')))) IN
+                 (N'VTV', N'SCHV', N'IWD', N'IVE')
+              OR
+              (
+                  @DescriptionText LIKE N'% VALUE %'
+                  AND
+                  (
+                      @DescriptionText LIKE N'%LARGE CAP%'
+                      OR @DescriptionText LIKE N'%LARGE-CAP%'
+                  )
+              )
+                THEN 'LargeValueEquity'
+            WHEN @DescriptionText LIKE N'% VALUE %'
+                THEN 'ValueEquityFund'
             WHEN @DescriptionText LIKE N'%S&P 500%'
               OR @DescriptionText LIKE N'%TOTAL STOCK%'
               OR @DescriptionText LIKE N'%TOTAL MARKET%'
@@ -180,7 +193,7 @@ BEGIN
         @CandidateClass,
         @Archetype,
         @ClassificationConfidence,
-        '1',
+        '2',
         CONVERT(bit, CASE WHEN @Archetype = 'Unclassified' THEN 1 ELSE 0 END)
     );
 
@@ -377,6 +390,7 @@ BEGIN
         Archetype = @Archetype,
         ClassificationMethod = 'MANUAL',
         ClassificationConfidence = 1.0000,
+        ClassificationRuleVersion = '2',
         NeedsReview = 0,
         InclusionReason = NULLIF(LTRIM(RTRIM(@InclusionReason)), N''),
         UpdatedAt = SYSDATETIMEOFFSET()
@@ -393,7 +407,7 @@ BEGIN
         VALUES
         (
             @SeriesId, @CandidateClass, @Archetype, 'MANUAL',
-            1.0000, '1', 0,
+            1.0000, '2', 0,
             NULLIF(LTRIM(RTRIM(@InclusionReason)), N'')
         );
     END;
