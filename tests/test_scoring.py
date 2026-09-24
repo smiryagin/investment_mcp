@@ -181,6 +181,8 @@ class ScoringMigrationTests(unittest.TestCase):
         self.assertIn("FROM inserted AS source", sql)
         self.assertIn("ClassificationMethod = 'AUTO'", sql)
         self.assertIn("WITH EXECUTE AS OWNER", sql)
+        self.assertIn("RETURNS @Classification TABLE", sql)
+        self.assertNotIn("RETURNS TABLE\nAS\nRETURN\n(\n    WITH normalized", sql)
         self.assertNotIn("ReferenceUniverseMembers", sql)
         self.assertNotIn("schwabapi.com", sql.lower())
 

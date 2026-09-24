@@ -61,115 +61,131 @@ CREATE OR ALTER FUNCTION invest.ResolveReferenceInstrumentClassification
     @Symbol nvarchar(50),
     @Name nvarchar(500)
 )
-RETURNS TABLE
-AS
-RETURN
+RETURNS @Classification TABLE
 (
-    WITH normalized AS
+    CandidateClass varchar(50) NOT NULL,
+    Archetype varchar(100) NOT NULL,
+    ClassificationConfidence decimal(5,4) NOT NULL,
+    ClassificationRuleVersion varchar(20) NOT NULL,
+    NeedsReview bit NOT NULL
+)
+AS
+BEGIN
+    DECLARE @TypeText nvarchar(500) = UPPER(CONCAT(
+        N' ', COALESCE(@Type, N''),
+        N' ', COALESCE(@AssetType, N''),
+        N' ', COALESCE(@AssetSubType, N''), N' '
+    ));
+
+    DECLARE @DescriptionText nvarchar(1000) = UPPER(CONCAT(
+        N' ', COALESCE(@Symbol, N''),
+        N' ', COALESCE(@Name, N''),
+        N' ', COALESCE(@Type, N''),
+        N' ', COALESCE(@AssetType, N''),
+        N' ', COALESCE(@AssetSubType, N''), N' '
+    ));
+
+    DECLARE @CandidateClass varchar(50) =
+        CASE
+            WHEN @DescriptionText LIKE N'%TARGET%RETIREMENT%'
+              OR @DescriptionText LIKE N'%TARGET%DATE%'
+                THEN 'MutualFund'
+            WHEN @TypeText LIKE N'%MUTUAL%'
+                THEN 'MutualFund'
+            WHEN @TypeText LIKE N'%ETF%'
+                THEN 'ETF'
+            WHEN @TypeText LIKE N'%EQUITY%'
+              OR @TypeText LIKE N'%STOCK%'
+                THEN 'Stock'
+            WHEN @TypeText LIKE N'%BOND%'
+              OR @TypeText LIKE N'%FIXED INCOME%'
+                THEN 'Bond'
+            ELSE 'Other'
+        END;
+
+    DECLARE @Archetype varchar(100) =
+        CASE
+            WHEN @DescriptionText LIKE N'%TARGET%RETIREMENT%'
+              OR @DescriptionText LIKE N'%TARGET%DATE%'
+                THEN 'TargetDateMultiAsset'
+            WHEN @DescriptionText LIKE N'%INTERNATIONAL%'
+              OR @DescriptionText LIKE N'%EX-US%'
+              OR @DescriptionText LIKE N'%FOREIGN%'
+              OR @DescriptionText LIKE N'%EMERGING%'
+                THEN 'InternationalEquity'
+            WHEN @DescriptionText LIKE N'%BOND%'
+              OR @DescriptionText LIKE N'%TREASURY%'
+              OR @DescriptionText LIKE N'%CREDIT%'
+              OR @DescriptionText LIKE N'%FIXED INCOME%'
+              OR @DescriptionText LIKE N'%HIGH YIELD%'
+                THEN 'FixedIncomeCredit'
+            WHEN @DescriptionText LIKE N'%GOLD%'
+              OR @DescriptionText LIKE N'%COMMOD%'
+              OR @DescriptionText LIKE N'%REAL ESTATE%'
+              OR @DescriptionText LIKE N'%REIT%'
+                THEN 'DefensiveRealAssets'
+            WHEN @DescriptionText LIKE N'%SMALL CAP%'
+              OR @DescriptionText LIKE N'%SMALL-CAP%'
+              OR @DescriptionText LIKE N'%MID CAP%'
+              OR @DescriptionText LIKE N'%MID-CAP%'
+              OR @DescriptionText LIKE N'% VALUE %'
+                THEN 'SmallMidFactorEquity'
+            WHEN @DescriptionText LIKE N'%TECHNOLOGY%'
+              OR @DescriptionText LIKE N'%SEMICONDUCTOR%'
+              OR @DescriptionText LIKE N'%HEALTH CARE%'
+              OR @DescriptionText LIKE N'% ENERGY %'
+              OR @DescriptionText LIKE N'% SECTOR %'
+                THEN 'SectorEquity'
+            WHEN @DescriptionText LIKE N'% GROWTH %'
+                THEN 'GrowthEquityFund'
+            WHEN @DescriptionText LIKE N'%S&P 500%'
+              OR @DescriptionText LIKE N'%TOTAL STOCK%'
+              OR @DescriptionText LIKE N'%TOTAL MARKET%'
+              OR @DescriptionText LIKE N'%BROAD MARKET%'
+              OR @DescriptionText LIKE N'%LARGE CAP%'
+                THEN 'BroadUSEquity'
+            WHEN @TypeText LIKE N'%ETF%'
+              OR @TypeText LIKE N'%MUTUAL%'
+                THEN 'EquityFund'
+            WHEN @TypeText LIKE N'%EQUITY%'
+              OR @TypeText LIKE N'%STOCK%'
+                THEN 'IndividualStock'
+            ELSE 'Unclassified'
+        END;
+
+    DECLARE @ClassificationConfidence decimal(5,4) =
+        CASE
+            WHEN @DescriptionText LIKE N'%TARGET%RETIREMENT%'
+              OR @DescriptionText LIKE N'%TARGET%DATE%'
+                THEN CONVERT(decimal(5,4), 0.9500)
+            WHEN @TypeText LIKE N'%ETF%'
+              OR @TypeText LIKE N'%MUTUAL%'
+              OR @TypeText LIKE N'%EQUITY%'
+              OR @TypeText LIKE N'%STOCK%'
+              OR @TypeText LIKE N'%BOND%'
+                THEN CONVERT(decimal(5,4), 0.7500)
+            ELSE CONVERT(decimal(5,4), 0.2500)
+        END;
+
+    INSERT INTO @Classification
     (
-        SELECT
-            UPPER(CONCAT(
-                N' ', COALESCE(@Type, N''),
-                N' ', COALESCE(@AssetType, N''),
-                N' ', COALESCE(@AssetSubType, N''), N' '
-            )) AS TypeText,
-            UPPER(CONCAT(
-                N' ', COALESCE(@Symbol, N''),
-                N' ', COALESCE(@Name, N''),
-                N' ', COALESCE(@Type, N''),
-                N' ', COALESCE(@AssetType, N''),
-                N' ', COALESCE(@AssetSubType, N''), N' '
-            )) AS DescriptionText
-    ), resolved AS
-    (
-        SELECT
-            CASE
-                WHEN DescriptionText LIKE N'%TARGET%RETIREMENT%'
-                  OR DescriptionText LIKE N'%TARGET%DATE%'
-                    THEN 'MutualFund'
-                WHEN TypeText LIKE N'%MUTUAL%'
-                    THEN 'MutualFund'
-                WHEN TypeText LIKE N'%ETF%'
-                    THEN 'ETF'
-                WHEN TypeText LIKE N'%EQUITY%'
-                  OR TypeText LIKE N'%STOCK%'
-                    THEN 'Stock'
-                WHEN TypeText LIKE N'%BOND%'
-                  OR TypeText LIKE N'%FIXED INCOME%'
-                    THEN 'Bond'
-                ELSE 'Other'
-            END AS CandidateClass,
-            CASE
-                WHEN DescriptionText LIKE N'%TARGET%RETIREMENT%'
-                  OR DescriptionText LIKE N'%TARGET%DATE%'
-                    THEN 'TargetDateMultiAsset'
-                WHEN DescriptionText LIKE N'%INTERNATIONAL%'
-                  OR DescriptionText LIKE N'%EX-US%'
-                  OR DescriptionText LIKE N'%FOREIGN%'
-                  OR DescriptionText LIKE N'%EMERGING%'
-                    THEN 'InternationalEquity'
-                WHEN DescriptionText LIKE N'%BOND%'
-                  OR DescriptionText LIKE N'%TREASURY%'
-                  OR DescriptionText LIKE N'%CREDIT%'
-                  OR DescriptionText LIKE N'%FIXED INCOME%'
-                  OR DescriptionText LIKE N'%HIGH YIELD%'
-                    THEN 'FixedIncomeCredit'
-                WHEN DescriptionText LIKE N'%GOLD%'
-                  OR DescriptionText LIKE N'%COMMOD%'
-                  OR DescriptionText LIKE N'%REAL ESTATE%'
-                  OR DescriptionText LIKE N'%REIT%'
-                    THEN 'DefensiveRealAssets'
-                WHEN DescriptionText LIKE N'%SMALL CAP%'
-                  OR DescriptionText LIKE N'%SMALL-CAP%'
-                  OR DescriptionText LIKE N'%MID CAP%'
-                  OR DescriptionText LIKE N'%MID-CAP%'
-                  OR DescriptionText LIKE N'% VALUE %'
-                    THEN 'SmallMidFactorEquity'
-                WHEN DescriptionText LIKE N'%TECHNOLOGY%'
-                  OR DescriptionText LIKE N'%SEMICONDUCTOR%'
-                  OR DescriptionText LIKE N'%HEALTH CARE%'
-                  OR DescriptionText LIKE N'% ENERGY %'
-                  OR DescriptionText LIKE N'% SECTOR %'
-                    THEN 'SectorEquity'
-                WHEN DescriptionText LIKE N'% GROWTH %'
-                    THEN 'GrowthEquityFund'
-                WHEN DescriptionText LIKE N'%S&P 500%'
-                  OR DescriptionText LIKE N'%TOTAL STOCK%'
-                  OR DescriptionText LIKE N'%TOTAL MARKET%'
-                  OR DescriptionText LIKE N'%BROAD MARKET%'
-                  OR DescriptionText LIKE N'%LARGE CAP%'
-                    THEN 'BroadUSEquity'
-                WHEN TypeText LIKE N'%ETF%'
-                  OR TypeText LIKE N'%MUTUAL%'
-                    THEN 'EquityFund'
-                WHEN TypeText LIKE N'%EQUITY%'
-                  OR TypeText LIKE N'%STOCK%'
-                    THEN 'IndividualStock'
-                ELSE 'Unclassified'
-            END AS Archetype,
-            CASE
-                WHEN DescriptionText LIKE N'%TARGET%RETIREMENT%'
-                  OR DescriptionText LIKE N'%TARGET%DATE%'
-                    THEN CONVERT(decimal(5,4), 0.9500)
-                WHEN TypeText LIKE N'%ETF%'
-                  OR TypeText LIKE N'%MUTUAL%'
-                  OR TypeText LIKE N'%EQUITY%'
-                  OR TypeText LIKE N'%STOCK%'
-                  OR TypeText LIKE N'%BOND%'
-                    THEN CONVERT(decimal(5,4), 0.7500)
-                ELSE CONVERT(decimal(5,4), 0.2500)
-            END AS ClassificationConfidence
-        FROM normalized
-    )
-    SELECT
         CandidateClass,
         Archetype,
         ClassificationConfidence,
-        CONVERT(varchar(20), '1') AS ClassificationRuleVersion,
-        CONVERT(bit, CASE WHEN Archetype = 'Unclassified' THEN 1 ELSE 0 END)
-            AS NeedsReview
-    FROM resolved
-);
+        ClassificationRuleVersion,
+        NeedsReview
+    )
+    VALUES
+    (
+        @CandidateClass,
+        @Archetype,
+        @ClassificationConfidence,
+        '1',
+        CONVERT(bit, CASE WHEN @Archetype = 'Unclassified' THEN 1 ELSE 0 END)
+    );
+
+    RETURN;
+END;
 GO
 
 BEGIN TRY
