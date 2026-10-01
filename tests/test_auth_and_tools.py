@@ -1300,6 +1300,22 @@ class ActiveTokenLimitMigrationTests(unittest.TestCase):
         self.assertIn("ExpiresAt IS NULL OR ExpiresAt > @Now", migration)
         self.assertIn("IF @ActiveTokenCount >= 2", migration)
 
+    def test_issue_token_rejects_case_insensitive_active_name_duplicates(self) -> None:
+        migration = (
+            Path(server.__file__).parent
+            / "sql"
+            / "018_reject_duplicate_active_token_names.sql"
+        ).read_text(encoding="utf-8-sig")
+
+        self.assertIn("CREATE OR ALTER PROCEDURE invest.IssueApiToken", migration)
+        self.assertIn("WITH (UPDLOCK, HOLDLOCK)", migration)
+        self.assertIn("SET @TokenName = LTRIM(RTRIM(@TokenName))", migration)
+        self.assertIn("TokenName COLLATE Latin1_General_100_CI_AS", migration)
+        self.assertIn("RevokedAt IS NULL", migration)
+        self.assertIn("ExpiresAt IS NULL OR ExpiresAt > @Now", migration)
+        self.assertIn("THROW 50015", migration)
+        self.assertIn("IF @ActiveTokenCount >= 2", migration)
+
 
 class PortalIntegrationMigrationTests(unittest.TestCase):
     def test_portal_contract_is_entitlement_aware_and_least_privilege(self) -> None:
