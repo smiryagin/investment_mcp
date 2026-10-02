@@ -506,9 +506,11 @@ class OpeningPositionWriteTests(unittest.TestCase):
         class FakeCursor:
             def __init__(self) -> None:
                 self.statements: list[str] = []
+                self.calls: list[tuple[str, tuple[object, ...]]] = []
 
             def execute(self, sql, params=()):
                 self.statements.append(sql)
+                self.calls.append((sql, tuple(params)))
                 return self
 
         cursor = FakeCursor()
@@ -551,6 +553,16 @@ class OpeningPositionWriteTests(unittest.TestCase):
         sql = "\n".join(cursor.statements)
         self.assertIn("OPENING_POSITION", sql)
         self.assertNotIn("CashBalances", sql)
+        insert_sql, insert_params = next(
+            call_args
+            for call_args in cursor.calls
+            if "INSERT INTO invest.Transactions" in call_args[0]
+        )
+        self.assertIn("CAST(? AS datetimeoffset(7))", insert_sql)
+        self.assertEqual(
+            insert_params[-2],
+            "2026-08-10T19:00:00.000000+00:00",
+        )
         self.assertFalse(result["cash_updated"])
 
     def test_duplicate_symbols_are_rejected_before_write(self) -> None:
@@ -596,6 +608,24 @@ class ResearchProcedureTests(unittest.TestCase):
 
 
 class SqlServerTypeTests(unittest.TestCase):
+    def test_normalizes_client_datetimeoffset_to_utc_sql_string(self) -> None:
+        value = server._parse_datetimeoffset(
+            "2026-10-01T09:30:00-04:00",
+            "occurred_at",
+        )
+
+        self.assertEqual(
+            value.isoformat(timespec="microseconds"),
+            "2026-10-01T13:30:00.000000+00:00",
+        )
+
+    def test_rejects_client_timestamp_without_offset(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must include a UTC offset or Z"):
+            server._parse_datetimeoffset(
+                "2026-10-01T09:30:00",
+                "occurred_at",
+            )
+
     def test_decodes_datetimeoffset_odbc_value(self) -> None:
         raw = struct.pack(
             "<6hI2h",
@@ -611,6 +641,210 @@ class SqlServerTypeTests(unittest.TestCase):
         )
         value = server._decode_datetimeoffset(raw)
         self.assertEqual(value.isoformat(), "2026-08-07T15:30:10.123456-04:00")
+
+
+class DateTimeOffsetWriteTests(unittest.TestCase):
+    class FakeCursor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+        def execute(self, sql, params=()):
+            self.calls.append((sql, tuple(params)))
+            return self
+
+    @staticmethod
+    def _run_write(cursor):
+        def run_write(user_id, tool_name, key, payload, operation):
+            return operation(cursor)
+
+        return run_write
+
+    @staticmethod
+    def _find_call(cursor, fragment: str):
+        return next(call_args for call_args in cursor.calls if fragment in call_args[0])
+
+    def test_record_trade_execution_binds_utc_strings(self) -> None:
+        cursor = self.FakeCursor()
+        transaction = {
+            "TransactionId": "00000000-0000-0000-0000-000000000001",
+        }
+        balance = {
+            "AccountId": "00000000-0000-0000-0000-000000000010",
+        }
+        with patch.object(
+            server,
+            "_current_user_id",
+            return_value="caller-id",
+        ), patch.object(server, "_require_owned_account"), patch.object(
+            server,
+            "_rows_from_cursor",
+            side_effect=[[transaction], [balance]],
+        ), patch.object(server, "_write_audit"), patch.object(
+            server,
+            "_run_idempotent_write",
+            side_effect=self._run_write(cursor),
+        ):
+            server.record_trade_execution(
+                account_id="00000000-0000-0000-0000-000000000010",
+                client_execution_id="jpm-2026-10-01",
+                transaction_type="BUY",
+                symbol="JPM",
+                quantity=1,
+                price=310,
+                gross_amount=310,
+                currency="USD",
+                idempotency_key="00000000-0000-4000-8000-000000000011",
+                occurred_at="2026-10-01T09:30:00-04:00",
+                ctx=object(),
+            )
+
+        transaction_sql, transaction_params = self._find_call(
+            cursor,
+            "INSERT INTO invest.Transactions",
+        )
+        cash_sql, cash_params = self._find_call(
+            cursor,
+            "UPDATE invest.CashBalances",
+        )
+        self.assertIn("CAST(? AS datetimeoffset(7))", transaction_sql)
+        self.assertIn("CAST(? AS datetimeoffset(7))", cash_sql)
+        self.assertEqual(
+            transaction_params[-1],
+            "2026-10-01T13:30:00.000000+00:00",
+        )
+        self.assertEqual(
+            cash_params[2],
+            "2026-10-01T13:30:00.000000+00:00",
+        )
+
+    def test_update_cash_balance_casts_update_and_insert(self) -> None:
+        cursor = self.FakeCursor()
+        result = {
+            "AccountId": "00000000-0000-0000-0000-000000000010",
+            "Currency": "USD",
+        }
+        with patch.object(
+            server,
+            "_current_user_id",
+            return_value="caller-id",
+        ), patch.object(server, "_require_owned_account"), patch.object(
+            server,
+            "_rows_from_cursor",
+            side_effect=[[], [result]],
+        ), patch.object(server, "_write_audit"), patch.object(
+            server,
+            "_run_idempotent_write",
+            side_effect=self._run_write(cursor),
+        ):
+            server.update_cash_balance(
+                account_id="00000000-0000-0000-0000-000000000010",
+                currency="USD",
+                total_amount=100,
+                available_amount=90,
+                as_of="2026-10-01T09:30:00-04:00",
+                idempotency_key="00000000-0000-4000-8000-000000000011",
+                ctx=object(),
+            )
+
+        update_sql, update_params = self._find_call(
+            cursor,
+            "UPDATE invest.CashBalances",
+        )
+        insert_sql, insert_params = self._find_call(
+            cursor,
+            "INSERT INTO invest.CashBalances",
+        )
+        self.assertIn("CAST(? AS datetimeoffset(7))", update_sql)
+        self.assertIn("CAST(? AS datetimeoffset(7))", insert_sql)
+        self.assertEqual(
+            update_params[2],
+            "2026-10-01T13:30:00.000000+00:00",
+        )
+        self.assertEqual(
+            insert_params[-1],
+            "2026-10-01T13:30:00.000000+00:00",
+        )
+
+    def test_share_portfolio_casts_expiration_update_and_insert(self) -> None:
+        cursor = self.FakeCursor()
+        result = {
+            "PortfolioGrantId": "00000000-0000-0000-0000-000000000030",
+        }
+        with patch.object(
+            server,
+            "_current_user_id",
+            return_value="00000000-0000-0000-0000-000000000001",
+        ), patch.object(server, "_require_owned_account"), patch.object(
+            server,
+            "_rows_from_cursor",
+            side_effect=[[{"Exists": 1}], [], [result]],
+        ), patch.object(server, "_write_audit"), patch.object(
+            server,
+            "_run_idempotent_write",
+            side_effect=self._run_write(cursor),
+        ):
+            server.share_portfolio(
+                account_id="00000000-0000-0000-0000-000000000010",
+                recipient_user_id="00000000-0000-0000-0000-000000000002",
+                permissions=["VIEW"],
+                idempotency_key="00000000-0000-4000-8000-000000000011",
+                expires_at="2026-10-01T09:30:00-04:00",
+                ctx=object(),
+            )
+
+        update_sql, update_params = self._find_call(
+            cursor,
+            "UPDATE invest.PortfolioGrants",
+        )
+        insert_sql, insert_params = self._find_call(
+            cursor,
+            "INSERT INTO invest.PortfolioGrants",
+        )
+        self.assertIn("CAST(? AS datetimeoffset(7))", update_sql)
+        self.assertIn("CAST(? AS datetimeoffset(7))", insert_sql)
+        self.assertEqual(
+            update_params[1],
+            "2026-10-01T13:30:00.000000+00:00",
+        )
+        self.assertEqual(
+            insert_params[-1],
+            "2026-10-01T13:30:00.000000+00:00",
+        )
+
+
+@unittest.skipUnless(
+    os.getenv("MCP_TEST_SQLSERVER_CONN"),
+    "MCP_TEST_SQLSERVER_CONN is required for SQL Server integration tests.",
+)
+class SqlServerDateTimeOffsetIntegrationTests(unittest.TestCase):
+    def test_offset_timestamp_round_trips_as_the_same_utc_instant(self) -> None:
+        expected = server._parse_datetimeoffset(
+            "2026-10-01T09:30:00-04:00",
+            "occurred_at",
+        )
+        sql_value = expected.isoformat(timespec="microseconds")
+        connection = server.pyodbc.connect(
+            os.environ["MCP_TEST_SQLSERVER_CONN"],
+            autocommit=True,
+        )
+        try:
+            connection.add_output_converter(-155, server._decode_datetimeoffset)
+            row = connection.cursor().execute(
+                """
+                DECLARE @Values TABLE (OccurredAt datetimeoffset(7));
+                INSERT INTO @Values (OccurredAt)
+                VALUES (CAST(? AS datetimeoffset(7)));
+                SELECT OccurredAt FROM @Values;
+                """,
+                (sql_value,),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(
+            row[0].astimezone(timezone.utc),
+            datetime(2026, 10, 1, 13, 30, tzinfo=timezone.utc),
+        )
 
 
 class SchwabOAuthTests(unittest.TestCase):

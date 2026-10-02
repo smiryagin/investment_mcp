@@ -753,6 +753,24 @@ def _decode_datetimeoffset(raw_value: bytes) -> datetime:
     )
 
 
+def _parse_datetimeoffset(value: str | None, field_name: str) -> datetime:
+    """Parse a client timestamp and normalize the represented instant to UTC."""
+    if not value:
+        return datetime.now(timezone.utc)
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} must be an ISO-8601 timestamp."
+        ) from exc
+
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{field_name} must include a UTC offset or Z.")
+
+    return parsed.astimezone(timezone.utc)
+
+
 def _connect(*, autocommit: bool = True) -> pyodbc.Connection:
     connection = pyodbc.connect(
         _connection_string(),
@@ -3840,16 +3858,8 @@ def import_opening_positions(
         raise ValueError("positions must contain at least one opening position.")
     if len(positions) > 500:
         raise ValueError("positions cannot contain more than 500 entries.")
-    try:
-        occurred = (
-            datetime.fromisoformat(as_of)
-            if as_of
-            else datetime.now().astimezone()
-        )
-    except ValueError as exc:
-        raise ValueError("as_of must be an ISO-8601 timestamp.") from exc
-    if occurred.tzinfo is None:
-        raise ValueError("as_of must include a UTC offset or timezone.")
+    occurred = _parse_datetimeoffset(as_of, "as_of")
+    occurred_sql = occurred.isoformat(timespec="microseconds")
 
     normalized_positions: list[dict[str, Any]] = []
     seen_symbols: set[str] = set()
@@ -3877,7 +3887,7 @@ def import_opening_positions(
     payload = {
         "account_id": normalized_account_id,
         "positions": normalized_positions,
-        "as_of": occurred.isoformat(),
+        "as_of": occurred_sql,
     }
 
     def operation(cursor: pyodbc.Cursor) -> dict[str, Any]:
@@ -3933,7 +3943,8 @@ def import_opening_positions(
                     inserted.TradeDate,
                     inserted.OccurredAt
                 VALUES
-                    (?, ?, ?, 'OPENING_POSITION', ?, ?, ?, ?, 0, ?, ?, ?, ?);
+                    (?, ?, ?, 'OPENING_POSITION', ?, ?, ?, ?, 0, ?, ?,
+                     CAST(? AS datetimeoffset(7)), ?);
                 """,
                 (
                     user_id,
@@ -3945,7 +3956,7 @@ def import_opening_positions(
                     Decimal(position["total_cost_basis"]),
                     currency,
                     occurred.date(),
-                    occurred,
+                    occurred_sql,
                     metadata_json,
                 ),
             )
@@ -3960,7 +3971,7 @@ def import_opening_positions(
             {
                 "position_count": len(imported),
                 "symbols": [row["Symbol"] for row in imported],
-                "as_of": occurred.isoformat(),
+                "as_of": occurred_sql,
                 "cash_impact": False,
             },
         )
@@ -4405,10 +4416,8 @@ def record_trade_execution(
         raise ValueError("currency must be a three-letter uppercase code.")
     if not execution_id or len(execution_id) > 200:
         raise ValueError("client_execution_id must contain 1 to 200 characters.")
-    try:
-        occurred = datetime.fromisoformat(occurred_at) if occurred_at else datetime.now().astimezone()
-    except ValueError as exc:
-        raise ValueError("occurred_at must be an ISO-8601 timestamp.") from exc
+    occurred = _parse_datetimeoffset(occurred_at, "occurred_at")
+    occurred_sql = occurred.isoformat(timespec="microseconds")
     cash_delta = (
         -(Decimal(str(gross_amount)) + Decimal(str(fees)))
         if normalized_type == "BUY"
@@ -4425,7 +4434,7 @@ def record_trade_execution(
         "fees": fees,
         "currency": normalized_currency,
         "order_id": normalized_order_id,
-        "occurred_at": occurred.isoformat(),
+        "occurred_at": occurred_sql,
     }
 
     def operation(cursor: pyodbc.Cursor) -> dict[str, Any]:
@@ -4447,7 +4456,8 @@ def record_trade_execution(
                 inserted.Fees,
                 inserted.Currency,
                 inserted.OccurredAt
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    CAST(? AS datetimeoffset(7)));
             """,
             (
                 user_id,
@@ -4460,7 +4470,7 @@ def record_trade_execution(
                 gross_amount,
                 fees,
                 normalized_currency,
-                occurred,
+                occurred_sql,
             ),
         )
         transaction = _rows_from_cursor(cursor)[0]
@@ -4469,12 +4479,19 @@ def record_trade_execution(
             UPDATE invest.CashBalances WITH (UPDLOCK, SERIALIZABLE)
             SET TotalAmount = TotalAmount + ?,
                 AvailableAmount = AvailableAmount + ?,
-                AsOf = ?,
+                AsOf = CAST(? AS datetimeoffset(7)),
                 UpdatedAt = SYSDATETIMEOFFSET()
             OUTPUT inserted.AccountId
             WHERE UserId = ? AND AccountId = ? AND Currency = ?;
             """,
-            (cash_delta, cash_delta, occurred, user_id, normalized_account_id, normalized_currency),
+            (
+                cash_delta,
+                cash_delta,
+                occurred_sql,
+                user_id,
+                normalized_account_id,
+                normalized_currency,
+            ),
         )
         updated_balances = _rows_from_cursor(cursor)
         if not updated_balances:
@@ -4482,9 +4499,16 @@ def record_trade_execution(
                 """
                 INSERT INTO invest.CashBalances
                     (UserId, AccountId, Currency, TotalAmount, AvailableAmount, AsOf)
-                VALUES (?, ?, ?, ?, ?, ?);
+                VALUES (?, ?, ?, ?, ?, CAST(? AS datetimeoffset(7)));
                 """,
-                (user_id, normalized_account_id, normalized_currency, cash_delta, cash_delta, occurred),
+                (
+                    user_id,
+                    normalized_account_id,
+                    normalized_currency,
+                    cash_delta,
+                    cash_delta,
+                    occurred_sql,
+                ),
             )
 
         order_result: dict[str, Any] | None = None
@@ -4564,10 +4588,8 @@ def update_cash_balance(
     normalized_currency = currency.strip().upper()
     if not re.fullmatch(r"[A-Z]{3}", normalized_currency):
         raise ValueError("currency must be a three-letter uppercase code.")
-    try:
-        as_of_value = datetime.fromisoformat(as_of)
-    except ValueError as exc:
-        raise ValueError("as_of must be an ISO-8601 timestamp.") from exc
+    as_of_value = _parse_datetimeoffset(as_of, "as_of")
+    as_of_sql = as_of_value.isoformat(timespec="microseconds")
     version: bytes | None = None
     if expected_version:
         try:
@@ -4581,7 +4603,7 @@ def update_cash_balance(
         "currency": normalized_currency,
         "total_amount": total_amount,
         "available_amount": available_amount,
-        "as_of": as_of_value.isoformat(),
+        "as_of": as_of_sql,
         "expected_version": expected_version,
     }
 
@@ -4591,7 +4613,7 @@ def update_cash_balance(
         params: list[Any] = [
             total_amount,
             available_amount,
-            as_of_value,
+            as_of_sql,
             user_id,
             normalized_account_id,
             normalized_currency,
@@ -4601,7 +4623,8 @@ def update_cash_balance(
         cursor.execute(
             f"""
             UPDATE invest.CashBalances
-            SET TotalAmount = ?, AvailableAmount = ?, AsOf = ?,
+            SET TotalAmount = ?, AvailableAmount = ?,
+                AsOf = CAST(? AS datetimeoffset(7)),
                 UpdatedAt = SYSDATETIMEOFFSET()
             OUTPUT
                 inserted.AccountId, inserted.Currency, inserted.TotalAmount,
@@ -4621,9 +4644,16 @@ def update_cash_balance(
                 OUTPUT
                     inserted.AccountId, inserted.Currency, inserted.TotalAmount,
                     inserted.AvailableAmount, inserted.AsOf, inserted.RowVersion
-                VALUES (?, ?, ?, ?, ?, ?);
+                VALUES (?, ?, ?, ?, ?, CAST(? AS datetimeoffset(7)));
                 """,
-                (user_id, normalized_account_id, normalized_currency, total_amount, available_amount, as_of_value),
+                (
+                    user_id,
+                    normalized_account_id,
+                    normalized_currency,
+                    total_amount,
+                    available_amount,
+                    as_of_sql,
+                ),
             )
             rows = _rows_from_cursor(cursor)
         result = rows[0]
@@ -4949,16 +4979,18 @@ def share_portfolio(
     normalized_permissions = sorted({permission.strip().upper() for permission in permissions})
     if not normalized_permissions or not set(normalized_permissions) <= allowed_permissions:
         raise ValueError("permissions must contain VIEW, TRADE, and/or MANAGE.")
-    try:
-        expires = datetime.fromisoformat(expires_at) if expires_at else None
-    except ValueError as exc:
-        raise ValueError("expires_at must be an ISO-8601 timestamp.") from exc
+    expires = (
+        _parse_datetimeoffset(expires_at, "expires_at")
+        if expires_at
+        else None
+    )
+    expires_sql = expires.isoformat(timespec="microseconds") if expires else None
     permissions_json = json.dumps(normalized_permissions, separators=(",", ":"))
     payload = {
         "account_id": normalized_account_id,
         "recipient_user_id": normalized_recipient_id,
         "permissions": normalized_permissions,
-        "expires_at": expires.isoformat() if expires else None,
+        "expires_at": expires_sql,
     }
 
     def operation(cursor: pyodbc.Cursor) -> dict[str, Any]:
@@ -4970,14 +5002,20 @@ def share_portfolio(
             """
             UPDATE invest.PortfolioGrants
             SET PermissionsJson = ?, GrantedAt = SYSDATETIMEOFFSET(),
-                ExpiresAt = ?, RevokedAt = NULL
+                ExpiresAt = CAST(? AS datetimeoffset(7)), RevokedAt = NULL
             OUTPUT
                 inserted.PortfolioGrantId, inserted.AccountId,
                 inserted.RecipientUserId, inserted.PermissionsJson,
                 inserted.GrantedAt, inserted.ExpiresAt, inserted.RowVersion
             WHERE AccountId = ? AND OwnerUserId = ? AND RecipientUserId = ?;
             """,
-            (permissions_json, expires, normalized_account_id, user_id, normalized_recipient_id),
+            (
+                permissions_json,
+                expires_sql,
+                normalized_account_id,
+                user_id,
+                normalized_recipient_id,
+            ),
         )
         rows = _rows_from_cursor(cursor)
         if not rows:
@@ -4989,9 +5027,15 @@ def share_portfolio(
                     inserted.PortfolioGrantId, inserted.AccountId,
                     inserted.RecipientUserId, inserted.PermissionsJson,
                     inserted.GrantedAt, inserted.ExpiresAt, inserted.RowVersion
-                VALUES (?, ?, ?, ?, ?);
+                VALUES (?, ?, ?, ?, CAST(? AS datetimeoffset(7)));
                 """,
-                (normalized_account_id, user_id, normalized_recipient_id, permissions_json, expires),
+                (
+                    normalized_account_id,
+                    user_id,
+                    normalized_recipient_id,
+                    permissions_json,
+                    expires_sql,
+                ),
             )
             rows = _rows_from_cursor(cursor)
         result = rows[0]
