@@ -150,6 +150,7 @@ Run these in order against the investment database:
 15. `sql/015_grant_scoring_runtime.sql`
 16. `sql/016_add_holdings_overlap_and_scoring_v1_1.sql`
 18. `sql/018_reject_duplicate_active_token_names.sql`
+19. `sql/019_add_portal_cash_valuation.sql`
 
 The second migration adds idempotency records, order status history, the
 `(UserId, AccountId, ClientOrderId)` uniqueness rule, and soft-deletion fields.
