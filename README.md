@@ -12,11 +12,35 @@ The server does not expose a raw SQL tool. All database access is parameterized.
 Private portfolio tools derive the caller from the bearer token and scope every
 account query to that authenticated user.
 
-## OAuth design spike
+## Browser-based OAuth connections
 
-The proposed browser-based connection flow and resource-server contract are in
-[docs/MCP_OAUTH_RESOURCE_SERVER.md](docs/MCP_OAUTH_RESOURCE_SERVER.md). The
-public metadata readiness probe can be run without credentials:
+The hosted server accepts short-lived portal-issued OAuth JWTs alongside the
+existing database-backed manual tokens. OAuth clients discover the authorization
+server from the MCP protected-resource metadata, open WiseLine Trade for login
+and consent, and return to the AI client without asking the user to copy a
+token. Manual tokens remain available during the staged rollout.
+
+Before enabling OAuth, apply `sql/019_add_oauth_subject_authentication.sql` to
+Trade and the matching OpenIddict migration to the portal database. Configure
+the hosted MCP process with exact environment-specific values:
+
+```text
+MCP_OAUTH_ENABLED=true
+MCP_OAUTH_ISSUER=https://staging.wiselinetrade.com
+MCP_OAUTH_RESOURCE=https://staging-investments-mcp.wiselinetrade.com/mcp
+MCP_OAUTH_JWKS_URI=https://staging.wiselinetrade.com/.well-known/jwks
+MCP_OAUTH_ALLOWED_ALGORITHMS=RS256
+```
+
+The `MCP_OAUTH_RESOURCE` value must exactly match the public MCP URL and the
+portal token audience. Staging and production must use different issuers,
+resources, signing keys, and databases. The MCP process reads current
+entitlement from Trade through `invest.AuthenticateOAuthSubject`; it never
+connects to the portal database.
+
+The complete resource-server contract is in
+[docs/MCP_OAUTH_RESOURCE_SERVER.md](docs/MCP_OAUTH_RESOURCE_SERVER.md). Verify
+the public discovery contract without credentials after deployment:
 
 ```powershell
 python scripts/oauth_metadata_probe.py `
@@ -167,6 +191,7 @@ Run these in order against the investment database:
 15. `sql/015_grant_scoring_runtime.sql`
 16. `sql/016_add_holdings_overlap_and_scoring_v1_1.sql`
 18. `sql/018_reject_duplicate_active_token_names.sql`
+19. `sql/019_add_oauth_subject_authentication.sql`
 
 The second migration adds idempotency records, order status history, the
 `(UserId, AccountId, ClientOrderId)` uniqueness rule, and soft-deletion fields.

@@ -26,10 +26,14 @@ from urllib.request import Request, urlopen
 from uuid import UUID
 
 import pyodbc
+import jwt
+from jwt import PyJWKClient
+from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel, Field
+from pydantic import AnyHttpUrl, BaseModel, Field
 import uvicorn
 
 from scoring import (
@@ -62,25 +66,6 @@ def _load_local_env() -> None:
 
 
 _load_local_env()
-
-mcp = FastMCP(
-    "Investment SQL Server",
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=[
-            "127.0.0.1:8000",
-            "127.0.0.1:*",
-            "localhost:8000",
-            "localhost:*",
-            "investments-mcp.torusystems.com",
-            "mcp.wiselinetrade.com",
-        ],
-        allowed_origins=[
-            "https://investments-mcp.torusystems.com",
-            "https://mcp.wiselinetrade.com",
-        ],
-    ),
-)
 
 SYMBOL_RE = re.compile(r"^[A-Za-z0-9._/\-]{1,50}$")
 PROC_RE = re.compile(r"^[A-Za-z0-9_\[\].]+$")
@@ -239,6 +224,136 @@ class AuthIdentity:
     user_id: str | None
     api_token_id: str | None
     token_key: str
+    scopes: frozenset[str] | None = None
+    client_id: str | None = None
+    expires_at: int | None = None
+    issuer: str | None = None
+
+
+class OAuthJwtResolver:
+    def __init__(
+        self,
+        *,
+        issuer: str,
+        resource: str,
+        jwks_uri: str,
+        algorithms: tuple[str, ...],
+        leeway_seconds: int,
+        jwks_cache_seconds: int,
+    ) -> None:
+        self.issuer = issuer
+        self.resource = resource
+        self.algorithms = algorithms
+        self.leeway_seconds = leeway_seconds
+        self.jwks_client = PyJWKClient(
+            jwks_uri,
+            cache_keys=True,
+            cache_jwk_set=True,
+            lifespan=jwks_cache_seconds,
+            timeout=10,
+            headers={"User-Agent": "WiseLineInvestmentMCP/1.0"},
+        )
+
+    def resolve(self, token: str) -> AuthIdentity | None:
+        try:
+            signing_key = self.jwks_client.get_signing_key_from_jwt(token)
+            claims = jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=list(self.algorithms),
+                issuer=self.issuer,
+                audience=self.resource,
+                leeway=self.leeway_seconds,
+                options={
+                    "require": ["iss", "aud", "sub", "exp", "iat", "nbf", "jti"],
+                    "verify_signature": True,
+                    "verify_iss": True,
+                    "verify_aud": True,
+                    "verify_exp": True,
+                    "verify_iat": True,
+                    "verify_nbf": True,
+                },
+            )
+        except jwt.PyJWTError:
+            return None
+
+        subject = str(claims.get("sub") or "").strip().lower()
+        subject_pattern = (
+            r"portal:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}"
+        )
+        if not re.fullmatch(subject_pattern, subject):
+            return None
+
+        scopes = _parse_oauth_scopes(claims.get("scope"))
+        client_id = str(claims.get("client_id") or claims.get("azp") or "").strip()
+        if not client_id or not scopes:
+            return None
+
+        row = _fetch_one(
+            "EXEC invest.AuthenticateOAuthSubject @AuthenticationSubject = ?;",
+            (subject,),
+        )
+        if not row:
+            return None
+
+        user_id = str(row.get("UserId") or "").strip()
+        if not user_id:
+            return None
+
+        return AuthIdentity(
+            authentication_subject=subject,
+            user_id=user_id,
+            api_token_id=None,
+            token_key=str(claims["jti"]),
+            scopes=frozenset(scopes),
+            client_id=client_id,
+            expires_at=int(claims["exp"]),
+            issuer=str(claims["iss"]),
+        )
+
+
+class CompositeTokenVerifier(TokenVerifier):
+    def __init__(
+        self,
+        resolver: Callable[[str], AuthIdentity | None],
+        resource: str,
+    ) -> None:
+        self.resolver = resolver
+        self.resource = resource
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if not token or len(token) > 8192:
+            return None
+        identity = await asyncio.to_thread(self.resolver, token)
+        if identity is None:
+            return None
+
+        scopes = sorted(identity.scopes or {"investments.read", "investments.write"})
+        return AccessToken(
+            token=token,
+            client_id=identity.client_id or "wiseline-manual-token",
+            scopes=scopes,
+            expires_at=identity.expires_at,
+            resource=self.resource,
+            subject=identity.authentication_subject,
+            claims={
+                "iss": identity.issuer or "wiseline-manual-token",
+                "authentication_subject": identity.authentication_subject,
+                "trade_user_id": identity.user_id,
+                "api_token_id": identity.api_token_id,
+                "token_rate_key": identity.token_key,
+                "token_kind": "oauth" if identity.scopes is not None else "manual",
+            },
+        )
+
+
+def _parse_oauth_scopes(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return {item for item in value.split() if item}
+    if isinstance(value, list):
+        return {str(item).strip() for item in value if str(item).strip()}
+    return set()
 
 
 @dataclass
@@ -294,7 +409,7 @@ class BearerAuthASGI:
     def __init__(
         self,
         app: Any,
-        token_resolver: Callable[[str], AuthIdentity | str | None],
+        token_resolver: Callable[[str], AuthIdentity | str | None] | None,
         protected_path: str,
         *,
         token_concurrency_limiter: _KeyedConcurrencyLimiter | None = None,
@@ -312,44 +427,46 @@ class BearerAuthASGI:
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") == "http" and self._is_protected_path(scope):
-            authorization = self._header(scope, "authorization")
-            auth_parts = authorization.split(None, 1)
-            token = (
-                auth_parts[1]
-                if len(auth_parts) == 2 and auth_parts[0].lower() == "bearer"
-                else ""
-            )
-            if not token or len(token) > 512:
-                await self._unauthorized(send)
-                return
-
-            try:
-                resolved_identity = await asyncio.to_thread(
-                    self.token_resolver,
-                    token,
+            identity = self._authenticated_identity(scope)
+            if identity is None:
+                authorization = self._header(scope, "authorization")
+                auth_parts = authorization.split(None, 1)
+                token = (
+                    auth_parts[1]
+                    if len(auth_parts) == 2 and auth_parts[0].lower() == "bearer"
+                    else ""
                 )
-            except Exception:
-                LOGGER.exception("Bearer token validation failed unexpectedly.")
-                await self._service_unavailable(send)
-                return
-
-            if not resolved_identity:
-                await self._unauthorized(send)
-                return
-
-            if isinstance(resolved_identity, AuthIdentity):
-                identity = resolved_identity
-            else:
-                authentication_subject = str(resolved_identity).strip()
-                if not authentication_subject:
+                if not token or len(token) > 8192 or self.token_resolver is None:
                     await self._unauthorized(send)
                     return
-                identity = AuthIdentity(
-                    authentication_subject=authentication_subject,
-                    user_id=None,
-                    api_token_id=None,
-                    token_key=hashlib.sha256(token.encode("utf-8")).hexdigest(),
-                )
+
+                try:
+                    resolved_identity = await asyncio.to_thread(
+                        self.token_resolver,
+                        token,
+                    )
+                except Exception:
+                    LOGGER.exception("Bearer token validation failed unexpectedly.")
+                    await self._service_unavailable(send)
+                    return
+
+                if not resolved_identity:
+                    await self._unauthorized(send)
+                    return
+
+                if isinstance(resolved_identity, AuthIdentity):
+                    identity = resolved_identity
+                else:
+                    authentication_subject = str(resolved_identity).strip()
+                    if not authentication_subject:
+                        await self._unauthorized(send)
+                        return
+                    identity = AuthIdentity(
+                        authentication_subject=authentication_subject,
+                        user_id=None,
+                        api_token_id=None,
+                        token_key=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                    )
 
             scope = dict(scope)
             state = dict(scope.get("state") or {})
@@ -358,6 +475,8 @@ class BearerAuthASGI:
                 state["user_id"] = identity.user_id
             if identity.api_token_id:
                 state["api_token_id"] = identity.api_token_id
+            if identity.scopes is not None:
+                state["oauth_scopes"] = sorted(identity.scopes)
             # This is an API-token UUID for database tokens and a SHA-256
             # digest for temporary legacy tokens. The plaintext bearer token
             # is never copied into request state or logs.
@@ -409,6 +528,28 @@ class BearerAuthASGI:
                 return
 
         await self.app(scope, receive, send)
+
+    @staticmethod
+    def _authenticated_identity(scope: dict[str, Any]) -> AuthIdentity | None:
+        access_token = getattr(scope.get("user"), "access_token", None)
+        claims = getattr(access_token, "claims", None)
+        if not isinstance(claims, dict):
+            return None
+        authentication_subject = str(claims.get("authentication_subject") or "").strip()
+        token_key = str(claims.get("token_rate_key") or "").strip()
+        if not authentication_subject or not token_key:
+            return None
+        scopes = frozenset(str(scope_name) for scope_name in getattr(access_token, "scopes", []))
+        return AuthIdentity(
+            authentication_subject=authentication_subject,
+            user_id=str(claims.get("trade_user_id") or "").strip() or None,
+            api_token_id=str(claims.get("api_token_id") or "").strip() or None,
+            token_key=token_key,
+            scopes=scopes if claims.get("token_kind") == "oauth" else None,
+            client_id=str(getattr(access_token, "client_id", "") or "").strip() or None,
+            expires_at=getattr(access_token, "expires_at", None),
+            issuer=str(claims.get("iss") or "").strip() or None,
+        )
 
     def _is_protected_path(self, scope: dict[str, Any]) -> bool:
         path = scope.get("path", "")
@@ -654,8 +795,47 @@ def _resolve_database_token(token: str) -> AuthIdentity | None:
     )
 
 
+def _oauth_enabled() -> bool:
+    return os.getenv("MCP_OAUTH_ENABLED", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _required_https_url(environment_name: str) -> str:
+    value = os.getenv(environment_name, "").strip()
+    parsed = urlparse(value)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.fragment:
+        raise RuntimeError(f"{environment_name} must be an absolute HTTPS URL without a fragment.")
+    return value.rstrip("/") if parsed.path in {"", "/"} else value
+
+
+def _build_oauth_resolver() -> OAuthJwtResolver | None:
+    if not _oauth_enabled():
+        return None
+    algorithms = tuple(
+        item.strip()
+        for item in os.getenv("MCP_OAUTH_ALLOWED_ALGORITHMS", "RS256").split(",")
+        if item.strip()
+    )
+    supported_algorithms = {"RS256", "RS384", "RS512"}
+    if not algorithms or any(algorithm not in supported_algorithms for algorithm in algorithms):
+        raise RuntimeError("MCP_OAUTH_ALLOWED_ALGORITHMS contains an unsupported algorithm.")
+    return OAuthJwtResolver(
+        issuer=_required_https_url("MCP_OAUTH_ISSUER"),
+        resource=_required_https_url("MCP_OAUTH_RESOURCE"),
+        jwks_uri=_required_https_url("MCP_OAUTH_JWKS_URI"),
+        algorithms=algorithms,
+        leeway_seconds=max(0, min(int(os.getenv("MCP_OAUTH_CLOCK_SKEW_SECONDS", "60")), 300)),
+        jwks_cache_seconds=max(60, int(os.getenv("MCP_OAUTH_JWKS_CACHE_SECONDS", "3600"))),
+    )
+
+
 def _build_token_resolver() -> Callable[[str], AuthIdentity | None]:
     legacy_tokens = _load_token_subjects()
+    oauth_resolver = _build_oauth_resolver()
     configured_mode = os.getenv("MCP_TOKEN_AUTH_MODE", "").strip().lower()
     mode = configured_mode or ("legacy" if legacy_tokens else "database")
     if mode not in {"database", "hybrid", "legacy"}:
@@ -669,6 +849,9 @@ def _build_token_resolver() -> Callable[[str], AuthIdentity | None]:
         )
 
     def resolve(token: str) -> AuthIdentity | None:
+        if oauth_resolver is not None and token.count(".") == 2:
+            return oauth_resolver.resolve(token)
+
         if mode in {"database", "hybrid"}:
             try:
                 identity = _resolve_database_token(token)
@@ -696,15 +879,68 @@ def _build_token_resolver() -> Callable[[str], AuthIdentity | None]:
     return resolve
 
 
+def _transport_security() -> TransportSecuritySettings:
+    allowed_hosts = [
+        "127.0.0.1:8000",
+        "127.0.0.1:*",
+        "localhost:8000",
+        "localhost:*",
+        "investments-mcp.torusystems.com",
+        "mcp.wiselinetrade.com",
+    ]
+    allowed_origins = [
+        "https://investments-mcp.torusystems.com",
+        "https://mcp.wiselinetrade.com",
+    ]
+    if _oauth_enabled():
+        resource = urlparse(_required_https_url("MCP_OAUTH_RESOURCE"))
+        if resource.netloc not in allowed_hosts:
+            allowed_hosts.append(resource.netloc)
+        resource_origin = f"{resource.scheme}://{resource.netloc}"
+        if resource_origin not in allowed_origins:
+            allowed_origins.append(resource_origin)
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    )
+
+
+def _create_mcp_server() -> FastMCP:
+    common: dict[str, Any] = {
+        "transport_security": _transport_security(),
+    }
+    if _oauth_enabled():
+        issuer = _required_https_url("MCP_OAUTH_ISSUER")
+        resource = _required_https_url("MCP_OAUTH_RESOURCE")
+        common["token_verifier"] = CompositeTokenVerifier(_build_token_resolver(), resource)
+        common["auth"] = AuthSettings(
+            issuer_url=AnyHttpUrl(issuer),
+            resource_server_url=AnyHttpUrl(resource),
+            required_scopes=["investments.read", "investments.write"],
+            validate_token_resource=True,
+        )
+    return FastMCP("Investment SQL Server", **common)
+
+
+mcp = _create_mcp_server()
+
+
 def _run_streamable_http() -> None:
     host = os.getenv("FASTMCP_HOST", "127.0.0.1")
     port = int(os.getenv("FASTMCP_PORT", "8000"))
     protected_path = os.getenv("FASTMCP_STREAMABLE_HTTP_PATH", "/mcp")
-    app = BearerAuthASGI(
-        mcp.streamable_http_app(),
-        _build_token_resolver(),
-        protected_path,
-    )
+    app = mcp.streamable_http_app()
+    if _oauth_enabled():
+        protected_route = next(
+            (route for route in app.routes if getattr(route, "path", None) == protected_path),
+            None,
+        )
+        if protected_route is None:
+            raise RuntimeError(f"MCP protected route {protected_path!r} was not created.")
+        protected_route.app = BearerAuthASGI(protected_route.app, None, protected_path)
+    else:
+        app = BearerAuthASGI(app, _build_token_resolver(), protected_path)
     uvicorn.run(app, host=host, port=port)
 
 
@@ -1864,13 +2100,16 @@ def _request_authentication_subject(ctx: Context) -> str:
     raise PermissionError("Authenticated user identity is required.")
 
 
-def _current_user_id(ctx: Context) -> str:
+def _current_user_id(ctx: Context, required_scope: str = "investments.read") -> str:
     request_context = getattr(ctx, "request_context", None)
     request = getattr(request_context, "request", None)
     if request is not None:
         state = request.scope.get("state", {})
         authenticated_user_id = str(state.get("user_id", "")).strip()
         if authenticated_user_id:
+            oauth_scopes = state.get("oauth_scopes")
+            if isinstance(oauth_scopes, list) and required_scope not in oauth_scopes:
+                raise PermissionError(f"OAuth scope {required_scope} is required.")
             token_rate_key = str(state.get("token_rate_key", "")).strip() or None
             _enforce_general_mcp_limit(authenticated_user_id, token_rate_key)
             return authenticated_user_id
@@ -3594,6 +3833,30 @@ def get_score_history(
     return rows
 
 
+@mcp.tool(
+    annotations=READ_ONLY_TOOL,
+    meta={"openai/profile": True},
+)
+def get_my_profile(ctx: Context) -> dict[str, Any]:
+    """Return stable identity information for the connected WiseLine account."""
+    user_id = _current_user_id(ctx)
+    row = _fetch_one(
+        """
+        SELECT UserId, DisplayName
+        FROM invest.Users
+        WHERE UserId = ?
+          AND IsActive = 1;
+        """,
+        (user_id,),
+    )
+    if not row:
+        raise PermissionError("Authenticated user identity is not active.")
+    return {
+        "id": str(row["UserId"]),
+        "name": str(row.get("DisplayName") or "WiseLine investor"),
+    }
+
+
 @mcp.tool(annotations=READ_ONLY_TOOL)
 def get_my_accounts(ctx: Context) -> list[dict[str, Any]]:
     """Return only investment accounts owned by the authenticated caller."""
@@ -3630,7 +3893,7 @@ def create_account(
     base_currency: str = "USD",
 ) -> dict[str, Any]:
     """Create an investment account owned by the authenticated caller."""
-    user_id = _current_user_id(ctx)
+    user_id = _current_user_id(ctx, "investments.write")
     normalized_name = account_name.strip()
     normalized_type = account_type.strip() if account_type else None
     normalized_provider = provider_name.strip() if provider_name else None
@@ -3851,7 +4114,7 @@ def import_opening_positions(
     as_of: str | None = None,
 ) -> dict[str, Any]:
     """Import opening quantities and cost bases without changing account cash."""
-    user_id = _current_user_id(ctx)
+    user_id = _current_user_id(ctx, "investments.write")
     normalized_account_id = _canonical_uuid(account_id, "account_id")
     batch_key = _canonical_uuid(idempotency_key, "idempotency_key")
     if not positions:
@@ -4098,7 +4361,7 @@ def create_limit_order_record(
     expires_on: str | None = None,
 ) -> dict[str, Any]:
     """Create a caller-owned limit-order record with optional duration and expiration."""
-    user_id = _current_user_id(ctx)
+    user_id = _current_user_id(ctx, "investments.write")
     normalized_account_id = _canonical_uuid(account_id, "account_id")
     normalized_symbol = _clean_symbol(symbol)
     normalized_side = side.strip().upper()
@@ -4197,7 +4460,7 @@ def update_limit_order_record(
     expires_on: str | None = None,
 ) -> dict[str, Any]:
     """Update quantity, price, duration, or expiration using optimistic locking."""
-    user_id = _current_user_id(ctx)
+    user_id = _current_user_id(ctx, "investments.write")
     normalized_account_id = _canonical_uuid(account_id, "account_id")
     normalized_order_id = _canonical_uuid(order_id, "order_id")
     try:
@@ -4309,7 +4572,7 @@ def cancel_limit_order_record(
     reason: str | None = None,
 ) -> dict[str, Any]:
     """Soft-cancel a caller-owned order and append its status history."""
-    user_id = _current_user_id(ctx)
+    user_id = _current_user_id(ctx, "investments.write")
     normalized_account_id = _canonical_uuid(account_id, "account_id")
     normalized_order_id = _canonical_uuid(order_id, "order_id")
     try:
@@ -4401,7 +4664,7 @@ def record_trade_execution(
     occurred_at: str | None = None,
 ) -> dict[str, Any]:
     """Append a trade execution and atomically update cash and an optional order record."""
-    user_id = _current_user_id(ctx)
+    user_id = _current_user_id(ctx, "investments.write")
     normalized_account_id = _canonical_uuid(account_id, "account_id")
     normalized_order_id = _canonical_uuid(order_id, "order_id") if order_id else None
     normalized_type = transaction_type.strip().upper()
@@ -4583,7 +4846,7 @@ def update_cash_balance(
     expected_version: str | None = None,
 ) -> dict[str, Any]:
     """Set an owned account's cash balance with idempotency and optional optimistic locking."""
-    user_id = _current_user_id(ctx)
+    user_id = _current_user_id(ctx, "investments.write")
     normalized_account_id = _canonical_uuid(account_id, "account_id")
     normalized_currency = currency.strip().upper()
     if not re.fullmatch(r"[A-Z]{3}", normalized_currency):
@@ -4676,7 +4939,7 @@ def update_my_strategy(
     expected_version: str | None = None,
 ) -> dict[str, Any]:
     """Create or update a caller-owned strategy rule."""
-    user_id = _current_user_id(ctx)
+    user_id = _current_user_id(ctx, "investments.write")
     normalized_strategy_id = _canonical_uuid(strategy_rule_id, "strategy_rule_id") if strategy_rule_id else None
     normalized_account_id = _canonical_uuid(account_id, "account_id") if account_id else None
     try:
@@ -4970,7 +5233,7 @@ def share_portfolio(
     expires_at: str | None = None,
 ) -> dict[str, Any]:
     """Grant explicit portfolio permissions to another active user."""
-    user_id = _current_user_id(ctx)
+    user_id = _current_user_id(ctx, "investments.write")
     normalized_account_id = _canonical_uuid(account_id, "account_id")
     normalized_recipient_id = _canonical_uuid(recipient_user_id, "recipient_user_id")
     if normalized_recipient_id == user_id:
@@ -5053,7 +5316,7 @@ def revoke_portfolio_access(
     ctx: Context,
 ) -> dict[str, Any]:
     """Revoke a portfolio grant owned by the authenticated caller."""
-    user_id = _current_user_id(ctx)
+    user_id = _current_user_id(ctx, "investments.write")
     normalized_account_id = _canonical_uuid(account_id, "account_id")
     normalized_recipient_id = _canonical_uuid(recipient_user_id, "recipient_user_id")
     payload = {"account_id": normalized_account_id, "recipient_user_id": normalized_recipient_id}
@@ -5143,6 +5406,26 @@ invest.StrategyRules and invest.PortfolioGrants:
 invest.IdempotencyKeys, invest.OrderStatusEvents, invest.AuditLog:
   Duplicate-write prevention, append-only order status history, and audit events.
 """
+
+
+def _attach_oauth_tool_metadata() -> None:
+    if not _oauth_enabled():
+        return
+    for tool in mcp._tool_manager._tools.values():
+        is_read_only = bool(tool.annotations and tool.annotations.readOnlyHint)
+        scopes = ["investments.read"] if is_read_only else ["investments.read", "investments.write"]
+        tool.meta = {
+            **(tool.meta or {}),
+            "securitySchemes": [
+                {
+                    "type": "oauth2",
+                    "scopes": scopes,
+                }
+            ],
+        }
+
+
+_attach_oauth_tool_metadata()
 
 
 if __name__ == "__main__":
