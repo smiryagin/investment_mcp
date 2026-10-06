@@ -12,6 +12,23 @@ The server does not expose a raw SQL tool. All database access is parameterized.
 Private portfolio tools derive the caller from the bearer token and scope every
 account query to that authenticated user.
 
+## OAuth design spike
+
+The proposed browser-based connection flow and resource-server contract are in
+[docs/MCP_OAUTH_RESOURCE_SERVER.md](docs/MCP_OAUTH_RESOURCE_SERVER.md). The
+public metadata readiness probe can be run without credentials:
+
+```powershell
+python scripts/oauth_metadata_probe.py `
+  --resource 'https://investments-mcp.torusystems.com/mcp' `
+  --issuer 'https://wiselinetrade.com' `
+  --preconfigured-client
+```
+
+`--preconfigured-client` is required for the first-release design because the
+approved AI hosts are registered out of band and WiseLine does not claim open
+CIMD or Dynamic Client Registration support.
+
 ## Install
 
 ```powershell
