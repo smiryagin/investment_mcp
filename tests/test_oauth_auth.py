@@ -36,7 +36,6 @@ class OAuthJwtResolverTests(unittest.TestCase):
             "scope": "investments.read investments.write",
             "client_id": "https://chatgpt.com/oauth/client.json",
             "iat": 1,
-            "nbf": 1,
             "exp": 4_102_444_800,
             "jti": "oauth-token-id",
         }
@@ -66,6 +65,8 @@ class OAuthJwtResolverTests(unittest.TestCase):
         self.assertEqual(decode.call_args.kwargs["issuer"], ISSUER)
         self.assertEqual(decode.call_args.kwargs["audience"], RESOURCE)
         self.assertEqual(decode.call_args.kwargs["algorithms"], ["RS256"])
+        self.assertNotIn("nbf", decode.call_args.kwargs["options"]["require"])
+        self.assertTrue(decode.call_args.kwargs["options"]["verify_nbf"])
 
     def test_rejects_invalid_jwt_without_querying_trade(self) -> None:
         with patch.object(

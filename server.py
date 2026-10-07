@@ -265,7 +265,10 @@ class OAuthJwtResolver:
                 audience=self.resource,
                 leeway=self.leeway_seconds,
                 options={
-                    "require": ["iss", "aud", "sub", "exp", "iat", "nbf", "jti"],
+                    # OpenIddict access tokens do not include an nbf claim by
+                    # default. RFC 7519 defines nbf as optional, so validate it
+                    # when present without requiring it on every token.
+                    "require": ["iss", "aud", "sub", "exp", "iat", "jti"],
                     "verify_signature": True,
                     "verify_iss": True,
                     "verify_aud": True,
