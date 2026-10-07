@@ -11,9 +11,9 @@ import jwt
 import server
 
 
-ISSUER = "https://staging.wiselinetrade.com"
+ISSUER = "https://staging.wiselinetrade.com/"
 RESOURCE = "https://staging-investments-mcp.wiselinetrade.com/mcp"
-JWKS_URI = f"{ISSUER}/.well-known/jwks"
+JWKS_URI = f"{ISSUER}.well-known/jwks"
 SUBJECT = "portal:11111111-2222-3333-4444-555555555555"
 
 
@@ -177,6 +177,26 @@ class OAuthScopeTests(unittest.TestCase):
 
 
 class OAuthResourceServerTests(unittest.TestCase):
+    def test_root_oauth_issuer_preserves_canonical_trailing_slash(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"MCP_OAUTH_ISSUER": "https://staging.wiselinetrade.com"},
+            clear=False,
+        ):
+            issuer = server._required_oauth_issuer_url("MCP_OAUTH_ISSUER")
+
+        self.assertEqual(issuer, ISSUER)
+
+    def test_path_oauth_issuer_is_not_modified(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"MCP_OAUTH_ISSUER": "https://identity.example.com/tenant"},
+            clear=False,
+        ):
+            issuer = server._required_oauth_issuer_url("MCP_OAUTH_ISSUER")
+
+        self.assertEqual(issuer, "https://identity.example.com/tenant")
+
     def test_fastmcp_publishes_path_specific_protected_resource_metadata(self) -> None:
         with patch.dict(
             os.environ,

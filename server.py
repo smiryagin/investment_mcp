@@ -812,6 +812,20 @@ def _required_https_url(environment_name: str) -> str:
     return value.rstrip("/") if parsed.path in {"", "/"} else value
 
 
+def _required_oauth_issuer_url(environment_name: str) -> str:
+    """Return the issuer exactly as root OpenID Connect issuers are published.
+
+    OpenIddict canonicalizes a root issuer to an absolute URI ending in ``/``.
+    JWT issuer validation is an exact string comparison, so removing that slash
+    causes every otherwise-valid portal access token to be rejected.
+    """
+    value = _required_https_url(environment_name)
+    parsed = urlparse(value)
+    if parsed.path in {"", "/"}:
+        return parsed._replace(path="/").geturl()
+    return value
+
+
 def _build_oauth_resolver() -> OAuthJwtResolver | None:
     if not _oauth_enabled():
         return None
@@ -824,7 +838,7 @@ def _build_oauth_resolver() -> OAuthJwtResolver | None:
     if not algorithms or any(algorithm not in supported_algorithms for algorithm in algorithms):
         raise RuntimeError("MCP_OAUTH_ALLOWED_ALGORITHMS contains an unsupported algorithm.")
     return OAuthJwtResolver(
-        issuer=_required_https_url("MCP_OAUTH_ISSUER"),
+        issuer=_required_oauth_issuer_url("MCP_OAUTH_ISSUER"),
         resource=_required_https_url("MCP_OAUTH_RESOURCE"),
         jwks_uri=_required_https_url("MCP_OAUTH_JWKS_URI"),
         algorithms=algorithms,
@@ -911,7 +925,7 @@ def _create_mcp_server() -> FastMCP:
         "transport_security": _transport_security(),
     }
     if _oauth_enabled():
-        issuer = _required_https_url("MCP_OAUTH_ISSUER")
+        issuer = _required_oauth_issuer_url("MCP_OAUTH_ISSUER")
         resource = _required_https_url("MCP_OAUTH_RESOURCE")
         common["token_verifier"] = CompositeTokenVerifier(_build_token_resolver(), resource)
         common["auth"] = AuthSettings(
