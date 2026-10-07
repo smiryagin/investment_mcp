@@ -1,6 +1,6 @@
 # Investment MCP OAuth resource-server design
 
-Status: design spike. No runtime route or database has been changed.
+Status: implemented for staging. Production deployment remains a separate operational step.
 
 The portal-side protocol decision is documented in the `investment_portal` repository's `docs/MCP_OAUTH_DESIGN.md`. This document defines the Investment MCP half of that contract.
 
@@ -13,7 +13,7 @@ Investment MCP is an OAuth resource server, not an authorization server. It must
 - enforce scopes and current Trade entitlement;
 - expose the authenticated profile to supported AI hosts;
 - preserve current request quotas, concurrency limits, telemetry, and ownership checks;
-- continue accepting existing database-backed `imcp_...` tokens during migration.
+- reject manual tokens on the public endpoint while preserving them on a separately configured private compatibility endpoint.
 
 It must never issue OAuth tokens, render a login page, or connect to the WiseLinePortal database.
 
@@ -50,9 +50,9 @@ An unauthenticated or invalid request to `/mcp` returns `401` with a `WWW-Authen
 
 Staging must use a different resource URL and the staging portal issuer. Do not advertise the staging issuer for the production MCP URL.
 
-## Composite authentication
+## Endpoint authentication policy
 
-During transition, bearer credentials have two independent validation paths:
+The runtime has two independently controlled validation paths:
 
 1. An opaque `imcp_...` token is hashed and resolved through `invest.AuthenticateApiToken`, exactly as today.
 2. A compact JWT is validated using the portal issuer's discovery document/JWKS.
@@ -68,6 +68,11 @@ JWT validation must require:
 - a nonempty `sub` in the form `portal:<guid>`.
 
 Unknown token formats fail closed. If the authorization server or JWKS is temporarily unavailable, already cached valid keys may be used until their configured cache limit; an unknown signing key must not fall back to the opaque-token database path.
+
+The public endpoint sets `MCP_MANUAL_TOKEN_AUTH_ENABLED=false`. In this mode,
+non-JWT credentials fail before any database or legacy-token lookup. A private
+compatibility endpoint may leave the setting enabled and select database,
+hybrid, or legacy token handling with `MCP_TOKEN_AUTH_MODE`.
 
 ## Trade identity and entitlement
 
@@ -119,6 +124,7 @@ The final schema will follow the OpenAI profile-tool contract. Do not return por
 
 ```text
 MCP_OAUTH_ENABLED=true
+MCP_MANUAL_TOKEN_AUTH_ENABLED=false
 MCP_OAUTH_ISSUER=https://wiselinetrade.com
 MCP_OAUTH_RESOURCE=https://investments-mcp.torusystems.com/mcp
 MCP_OAUTH_JWKS_URI=https://wiselinetrade.com/.well-known/jwks
@@ -129,7 +135,10 @@ MCP_OAUTH_REQUIRED_READ_SCOPE=investments.read
 MCP_OAUTH_REQUIRED_WRITE_SCOPE=investments.write
 ```
 
-`MCP_TOKEN_AUTH_MODE=database` remains the legacy-token control during transition. OAuth and opaque-token acceptance should be controlled independently so OAuth can be disabled without breaking existing users.
+`MCP_TOKEN_AUTH_MODE=database` controls manual-token resolution only when
+`MCP_MANUAL_TOKEN_AUTH_ENABLED=true`. OAuth and opaque-token acceptance are
+independent so a private compatibility service can keep administrator-issued
+tokens without weakening the public endpoint.
 
 No private signing key or portal database credential belongs on the MCP host.
 
@@ -159,9 +168,9 @@ No response or log may include the bearer token, authorization code, refresh tok
 
 ## Safe migration order
 
-1. Deploy MCP support with OAuth disabled; legacy database tokens remain active.
+1. Deploy MCP support with OAuth disabled; private database tokens remain active.
 2. Publish staging portal OAuth endpoints and staging MCP metadata.
-3. Enable hybrid acceptance on staging.
+3. Enable OAuth-only acceptance on the public staging endpoint.
 4. Complete real client connections and revocation tests.
-5. Enable production OAuth while retaining manual tokens.
-6. Make OAuth the portal default only after client-compatibility acceptance passes.
+5. Enable production OAuth-only acceptance on the public endpoint.
+6. Keep any required manual-token access on a distinct private endpoint.

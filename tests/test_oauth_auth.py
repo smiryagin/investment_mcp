@@ -178,6 +178,48 @@ class OAuthScopeTests(unittest.TestCase):
 
 
 class OAuthResourceServerTests(unittest.TestCase):
+    def test_oauth_only_mode_rejects_manual_tokens_without_database_lookup(self) -> None:
+        oauth_identity = server.AuthIdentity(
+            authentication_subject=SUBJECT,
+            user_id="trade-user-id",
+            api_token_id=None,
+            token_key="oauth-jti",
+        )
+        oauth_resolver = SimpleNamespace(resolve=lambda token: oauth_identity)
+        with patch.dict(
+            os.environ,
+            {
+                "MCP_MANUAL_TOKEN_AUTH_ENABLED": "false",
+                "MCP_BEARER_TOKEN": "legacy-secret",
+                "MCP_DEFAULT_AUTH_SUBJECT": "local:legacy",
+            },
+            clear=False,
+        ), patch.object(
+            server,
+            "_build_oauth_resolver",
+            return_value=oauth_resolver,
+        ), patch.object(server, "_load_token_subjects") as load_legacy, patch.object(
+            server,
+            "_resolve_database_token",
+        ) as resolve_database:
+            resolver = server._build_token_resolver()
+
+            self.assertIsNone(resolver("imcp_manual-token"))
+            self.assertEqual(resolver("header.payload.signature"), oauth_identity)
+            load_legacy.assert_not_called()
+            resolve_database.assert_not_called()
+
+    def test_oauth_only_mode_requires_oauth(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"MCP_MANUAL_TOKEN_AUTH_ENABLED": "false"},
+            clear=False,
+        ), patch.object(server, "_build_oauth_resolver", return_value=None), self.assertRaisesRegex(
+            RuntimeError,
+            "MCP_OAUTH_ENABLED must be true",
+        ):
+            server._build_token_resolver()
+
     def test_root_oauth_issuer_preserves_canonical_trailing_slash(self) -> None:
         with patch.dict(
             os.environ,

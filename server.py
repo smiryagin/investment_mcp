@@ -807,6 +807,15 @@ def _oauth_enabled() -> bool:
     }
 
 
+def _manual_token_auth_enabled() -> bool:
+    return os.getenv("MCP_MANUAL_TOKEN_AUTH_ENABLED", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _required_https_url(environment_name: str) -> str:
     value = os.getenv(environment_name, "").strip()
     parsed = urlparse(value)
@@ -851,8 +860,21 @@ def _build_oauth_resolver() -> OAuthJwtResolver | None:
 
 
 def _build_token_resolver() -> Callable[[str], AuthIdentity | None]:
-    legacy_tokens = _load_token_subjects()
     oauth_resolver = _build_oauth_resolver()
+    if not _manual_token_auth_enabled():
+        if oauth_resolver is None:
+            raise RuntimeError(
+                "MCP_OAUTH_ENABLED must be true when manual token authentication is disabled."
+            )
+
+        def resolve_oauth_only(token: str) -> AuthIdentity | None:
+            if token.count(".") != 2:
+                return None
+            return oauth_resolver.resolve(token)
+
+        return resolve_oauth_only
+
+    legacy_tokens = _load_token_subjects()
     configured_mode = os.getenv("MCP_TOKEN_AUTH_MODE", "").strip().lower()
     mode = configured_mode or ("legacy" if legacy_tokens else "database")
     if mode not in {"database", "hybrid", "legacy"}:

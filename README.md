@@ -14,11 +14,11 @@ account query to that authenticated user.
 
 ## Browser-based OAuth connections
 
-The hosted server accepts short-lived portal-issued OAuth JWTs alongside the
-existing database-backed manual tokens. OAuth clients discover the authorization
-server from the MCP protected-resource metadata, open WiseLine Trade for login
-and consent, and return to the AI client without asking the user to copy a
-token. Manual tokens remain available during the staged rollout.
+The public hosted server accepts short-lived portal-issued OAuth JWTs. OAuth
+clients discover the authorization server from the MCP protected-resource
+metadata, open WiseLine Trade for login and consent, and return to the AI client
+without asking the user to copy a token. Database-backed tokens remain available
+only on a separately configured private compatibility endpoint.
 
 Before enabling OAuth, apply `sql/019_add_oauth_subject_authentication.sql` to
 Trade and the matching OpenIddict migration to the portal database. Configure
@@ -26,6 +26,7 @@ the hosted MCP process with exact environment-specific values:
 
 ```text
 MCP_OAUTH_ENABLED=true
+MCP_MANUAL_TOKEN_AUTH_ENABLED=false
 MCP_OAUTH_ISSUER=https://staging.wiselinetrade.com
 MCP_OAUTH_RESOURCE=https://staging-investments-mcp.wiselinetrade.com/mcp
 MCP_OAUTH_JWKS_URI=https://staging.wiselinetrade.com/.well-known/jwks
@@ -37,6 +38,11 @@ portal token audience. Staging and production must use different issuers,
 resources, signing keys, and databases. The MCP process reads current
 entitlement from Trade through `invest.AuthenticateOAuthSubject`; it never
 connects to the portal database.
+
+`MCP_MANUAL_TOKEN_AUTH_ENABLED=false` is the production policy for public MCP
+endpoints. It rejects both database and environment-backed manual tokens before
+any token lookup. Omit the setting or set it to `true` only on a private endpoint
+that intentionally supports administrator-issued fallback tokens.
 
 The complete resource-server contract is in
 [docs/MCP_OAUTH_RESOURCE_SERVER.md](docs/MCP_OAUTH_RESOURCE_SERVER.md). Verify
@@ -513,8 +519,10 @@ more than one active opening position for the same user, account, and symbol.
 
 ## Database-backed bearer identity
 
-Each user can have at most two active, independently revocable tokens. Expired
-and revoked tokens do not count toward the limit. SQL Server stores
+Database tokens are an administrator-operated compatibility mechanism, not a
+public self-service feature. Each user can have at most two active,
+independently revocable tokens. Expired and revoked tokens do not count toward
+the limit. SQL Server stores
 only a SHA-256 digest of each cryptographically random 256-bit token. The MCP
 runtime cannot read token hashes or issue tokens; it can only execute
 `invest.AuthenticateApiToken`.
