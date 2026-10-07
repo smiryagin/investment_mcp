@@ -961,8 +961,35 @@ def _run_streamable_http() -> None:
     uvicorn.run(app, host=host, port=port)
 
 
+def _validate_sql_configuration() -> None:
+    """Fail startup without exposing SQL credentials when configuration is incomplete."""
+    if os.getenv("SQLSERVER_CONN", "").strip():
+        return
+
+    missing = [
+        name
+        for name in ("SQLSERVER_SERVER", "SQLSERVER_DATABASE")
+        if not os.getenv(name, "").strip()
+    ]
+    trusted = os.getenv("SQLSERVER_TRUSTED_CONNECTION", "yes").strip().lower()
+    if trusted not in {"1", "true", "yes", "on"}:
+        missing.extend(
+            name
+            for name in ("SQLSERVER_USER", "SQLSERVER_PASSWORD")
+            if not os.getenv(name, "").strip()
+        )
+
+    if missing:
+        raise RuntimeError(
+            "SQL Server configuration is incomplete. Set SQLSERVER_CONN or provide: "
+            + ", ".join(missing)
+            + "."
+        )
+
+
 def _connection_string() -> str:
-    explicit = os.getenv("SQLSERVER_CONN")
+    _validate_sql_configuration()
+    explicit = os.getenv("SQLSERVER_CONN", "").strip()
     if explicit:
         return explicit
 
@@ -5446,6 +5473,7 @@ _attach_oauth_tool_metadata()
 
 
 if __name__ == "__main__":
+    _validate_sql_configuration()
     transport = os.getenv("MCP_TRANSPORT", "stdio")
     if transport == "streamable-http":
         _run_streamable_http()

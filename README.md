@@ -65,6 +65,23 @@ copy .env.example .env
 
 Edit `.env` with your SQL Server name and database name.
 
+For parallel NSSM services on Windows, synchronize only the SQL connection
+settings from an existing service instead of copying its complete `.env`. This
+preserves environment-specific OAuth URLs, ports, and token settings, creates a
+timestamped backup when the target already has an `.env`, and never prints SQL
+credential values:
+
+```powershell
+.\scripts\Sync-McpServiceSqlConfiguration.ps1 `
+  -SourceServiceName 'InvestmentMcp' `
+  -TargetServiceName 'InvestmentMcp-Staging' `
+  -RestartTargetService
+```
+
+The server validates SQL configuration before starting. Configure either
+`SQLSERVER_CONN` or `SQLSERVER_SERVER` plus `SQLSERVER_DATABASE`; SQL
+authentication also requires `SQLSERVER_USER` and `SQLSERVER_PASSWORD`.
+
 ## SQL Permissions
 
 Use a read-only SQL login/user if possible:
