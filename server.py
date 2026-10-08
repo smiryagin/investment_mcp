@@ -982,7 +982,7 @@ def _create_mcp_server() -> FastMCP:
             required_scopes=["investments.read", "investments.write"],
             validate_token_resource=True,
         )
-    return FastMCP("Investment SQL Server", **common)
+    return FastMCP("WiseLine Trade Investments", **common)
 
 
 mcp = _create_mcp_server()

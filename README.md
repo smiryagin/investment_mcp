@@ -20,6 +20,16 @@ metadata, open WiseLine Trade for login and consent, and return to the AI client
 without asking the user to copy a token. Database-backed tokens remain available
 only on a separately configured private compatibility endpoint.
 
+The repository also contains a draft Agent Plugins package in `plugin.json` and
+`mcp.json`. Its OpenAI listing metadata identifies the developer as WiseLine
+Trade, uses the supported `Finance` category, and links to
+`https://wiselinetrade.com`. A raw custom MCP connection still uses the name and
+description entered by the person creating it; install or publish the packaged
+plugin to apply the branded listing metadata. Before public submission, add live
+privacy-policy and terms-of-service pages and their URLs to `plugin.json`, add
+the required brand assets, and replace the staging MCP URL in `mcp.json` with
+the production endpoint.
+
 Before enabling OAuth, apply `sql/019_add_oauth_subject_authentication.sql` to
 Trade and the matching OpenIddict migration to the portal database. Configure
 the hosted MCP process with exact environment-specific values:

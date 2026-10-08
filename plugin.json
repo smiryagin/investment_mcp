@@ -1,0 +1,42 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "wiseline-trade-investments",
+  "version": "0.1.0",
+  "description": "Secure portfolio, investment research, and planning tools from WiseLine Trade.",
+  "author": {
+    "name": "WiseLine Trade",
+    "url": "https://wiselinetrade.com"
+  },
+  "homepage": "https://wiselinetrade.com",
+  "repository": "https://github.com/smiryagin/investment_mcp",
+  "keywords": [
+    "finance",
+    "investments",
+    "portfolio",
+    "mcp"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "WiseLine Trade Investments",
+        "shortDescription": "Investment portfolio tools",
+        "longDescription": "Connect your WiseLine Trade account to review portfolios, positions, research, cash, order records, and investment strategies. WiseLine Trade provides investment context and planning tools; it never executes brokerage trades.",
+        "developerName": "WiseLine Trade",
+        "category": "Finance",
+        "capabilities": [
+          "Portfolio insights",
+          "Investment research",
+          "Portfolio management"
+        ],
+        "websiteURL": "https://wiselinetrade.com",
+        "supportURL": "https://wiselinetrade.com/docs",
+        "defaultPrompt": [
+          "List my portfolios and summarize their current positions.",
+          "Show the investment research available for my portfolio holdings.",
+          "Explain the WiseLine investment tools available to me."
+        ],
+        "brandColor": "#17624A"
+      }
+    }
+  }
+}
