@@ -89,8 +89,27 @@ class BearerAuthenticationTests(unittest.TestCase):
         async def send(message):
             messages.append(message)
 
-        asyncio.run(middleware(scope, receive, send))
+        with patch.dict(
+            os.environ,
+            {
+                "MCP_OAUTH_ENABLED": "true",
+                "MCP_OAUTH_RESOURCE": (
+                    "https://staging-investments-mcp.wiselinetrade.com/mcp"
+                ),
+            },
+            clear=False,
+        ):
+            asyncio.run(middleware(scope, receive, send))
         self.assertEqual(messages[0]["status"], 401)
+        headers = dict(messages[0]["headers"])
+        self.assertEqual(
+            headers[b"www-authenticate"],
+            (
+                b'Bearer resource_metadata="https://staging-investments-mcp.'
+                b'wiselinetrade.com/.well-known/oauth-protected-resource/mcp", '
+                b'scope="investments.read investments.write"'
+            ),
+        )
 
     def test_database_token_is_hashed_before_lookup(self) -> None:
         token = "imcp_" + "a" * 64

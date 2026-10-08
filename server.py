@@ -33,7 +33,7 @@ from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
-from pydantic import AnyHttpUrl, BaseModel, Field
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field
 import uvicorn
 
 from scoring import (
@@ -216,6 +216,17 @@ class OpeningPositionInput(BaseModel):
         allow_inf_nan=False,
         description="Total cost basis for this opening quantity in account currency.",
     )
+
+
+class ConnectedProfile(BaseModel):
+    """Stable ChatGPT account-link identity returned by the profile tool."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, pattern=r"\S")
+    name: str = ""
+    email: str = ""
+    nickname: str = ""
 
 
 @dataclass(frozen=True)
@@ -663,13 +674,25 @@ class BearerAuthASGI:
                     )
 
     async def _unauthorized(self, send: Any) -> None:
+        challenge = 'Bearer realm="investment-mcp"'
+        if _oauth_enabled():
+            resource = urlparse(_required_https_url("MCP_OAUTH_RESOURCE"))
+            resource_path = resource.path.rstrip("/")
+            metadata_url = (
+                f"{resource.scheme}://{resource.netloc}"
+                f"/.well-known/oauth-protected-resource{resource_path}"
+            )
+            challenge = (
+                f'Bearer resource_metadata="{metadata_url}", '
+                'scope="investments.read investments.write"'
+            )
         await send(
             {
                 "type": "http.response.start",
                 "status": 401,
                 "headers": [
                     (b"content-type", b"text/plain; charset=utf-8"),
-                    (b"www-authenticate", b'Bearer realm="investment-mcp"'),
+                    (b"www-authenticate", challenge.encode("latin1")),
                 ],
             }
         )
@@ -3903,7 +3926,7 @@ def get_score_history(
     annotations=READ_ONLY_TOOL,
     meta={"openai/profile": True},
 )
-def get_my_profile(ctx: Context) -> dict[str, Any]:
+def get_my_profile(ctx: Context) -> ConnectedProfile:
     """Return stable identity information for the connected WiseLine account."""
     user_id = _current_user_id(ctx)
     row = _fetch_one(
@@ -3917,10 +3940,10 @@ def get_my_profile(ctx: Context) -> dict[str, Any]:
     )
     if not row:
         raise PermissionError("Authenticated user identity is not active.")
-    return {
-        "id": str(row["UserId"]),
-        "name": str(row.get("DisplayName") or "WiseLine investor"),
-    }
+    return ConnectedProfile(
+        id=str(row["UserId"]),
+        name=str(row.get("DisplayName") or "WiseLine investor"),
+    )
 
 
 @mcp.tool(annotations=READ_ONLY_TOOL)

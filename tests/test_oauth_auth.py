@@ -273,7 +273,18 @@ class OAuthResourceServerTests(unittest.TestCase):
                 write_scheme["scopes"],
                 ["investments.read", "investments.write"],
             )
-            self.assertTrue(tools["get_my_profile"].meta["openai/profile"])
+            profile_tool = tools["get_my_profile"]
+            self.assertTrue(profile_tool.meta["openai/profile"])
+            self.assertFalse(profile_tool.output_schema["additionalProperties"])
+            self.assertEqual(profile_tool.output_schema["required"], ["id"])
+            self.assertEqual(
+                profile_tool.output_schema["properties"]["id"]["type"],
+                "string",
+            )
+            self.assertEqual(
+                profile_tool.output_schema["properties"]["id"]["minLength"],
+                1,
+            )
         finally:
             for name, meta in original_meta.items():
                 tools[name].meta = meta
