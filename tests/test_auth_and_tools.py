@@ -453,6 +453,26 @@ class ToolSchemaTests(unittest.TestCase):
         )
 
 
+class ConnectedProfileTests(unittest.TestCase):
+    def test_profile_uses_display_name_as_account_nickname(self) -> None:
+        with patch.object(
+            server,
+            "_current_user_id",
+            return_value="00000000-0000-0000-0000-000000000001",
+        ), patch.object(
+            server,
+            "_fetch_one",
+            return_value={
+                "UserId": "00000000-0000-0000-0000-000000000001",
+                "DisplayName": "Andrey",
+            },
+        ):
+            profile = server.get_my_profile(None)
+
+        self.assertEqual(profile.name, "Andrey")
+        self.assertEqual(profile.nickname, "Andrey")
+
+
 class SharedPortfolioTests(unittest.TestCase):
     def test_shared_portfolio_scopes_every_query_to_active_view_grant(self) -> None:
         account_id = "00000000-0000-0000-0000-000000000010"

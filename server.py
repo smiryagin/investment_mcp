@@ -3940,9 +3940,11 @@ def get_my_profile(ctx: Context) -> ConnectedProfile:
     )
     if not row:
         raise PermissionError("Authenticated user identity is not active.")
+    display_name = str(row.get("DisplayName") or "WiseLine investor")
     return ConnectedProfile(
         id=str(row["UserId"]),
-        name=str(row.get("DisplayName") or "WiseLine investor"),
+        name=display_name,
+        nickname=display_name,
     )
 
 
