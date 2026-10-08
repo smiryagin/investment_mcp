@@ -17,6 +17,7 @@
   ],
   "extensions": {
     "com.openai": {
+      "apps": "./.app.json",
       "interface": {
         "displayName": "WiseLine Trade Investments",
         "shortDescription": "Investment portfolio tools",

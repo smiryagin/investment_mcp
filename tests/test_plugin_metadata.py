@@ -17,15 +17,22 @@ class PluginMetadataTests(unittest.TestCase):
         self.assertEqual(interface["websiteURL"], "https://wiselinetrade.com")
         self.assertIn("Investment portfolio tools", interface["shortDescription"])
 
-    def test_packaged_mcp_server_uses_staging_oauth_endpoint(self) -> None:
-        manifest = json.loads((REPOSITORY_ROOT / "mcp.json").read_text(encoding="utf-8"))
-        server = manifest["mcpServers"]["wiseline-investments"]
-
-        self.assertEqual(server["type"], "streamable-http")
-        self.assertEqual(
-            server["url"],
-            "https://staging-investments-mcp.wiselinetrade.com/mcp",
+    def test_package_maps_the_registered_chatgpt_connection(self) -> None:
+        plugin = json.loads((REPOSITORY_ROOT / "plugin.json").read_text(encoding="utf-8"))
+        app_manifest = json.loads(
+            (REPOSITORY_ROOT / ".app.json").read_text(encoding="utf-8")
         )
+        app = app_manifest["apps"]["wiseline-investments"]
+
+        self.assertEqual(
+            plugin["extensions"]["com.openai"]["apps"],
+            "./.app.json",
+        )
+        self.assertEqual(
+            app["id"],
+            "asdk_app_6ac7b51e8b048191a06b8d5b52cdfae6",
+        )
+        self.assertTrue(app["required"])
 
 
 if __name__ == "__main__":
