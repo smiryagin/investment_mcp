@@ -170,7 +170,8 @@ Caller-scoped portfolio tools:
 
 - `create_account`
 - `get_my_accounts`
-- `get_my_portfolio` (accounts, cash, positions, and applicable strategy rules)
+- `get_my_portfolio` (accounts, cash, stored-price market values, positions, and
+  applicable strategy rules)
 - `import_opening_positions`
 - `get_my_open_orders`
 - `record_trade_execution`
@@ -227,6 +228,7 @@ Run these in order against the investment database:
 18. `sql/018_reject_duplicate_active_token_names.sql`
 19. `sql/019_add_oauth_subject_authentication.sql`
 20. `sql/020_add_portal_strategy_context.sql`
+21. `sql/021_add_mcp_latest_prices.sql`
 
 The second migration adds idempotency records, order status history, the
 `(UserId, AccountId, ClientOrderId)` uniqueness rule, and soft-deletion fields.
@@ -237,6 +239,12 @@ internal `TEMP` and `PORTF` calculation series; and omits status, watch/trade,
 fallback-price, alternate-symbol, and data-range fields. It grants
 `mcp_connector` access to the view and denies direct reads from `dbo.Series`.
 Watched/traded tools use the filtered research procedure instead of the view.
+
+Migration `021` creates `invest.McpLatestPrices`, a least-privilege view exposing
+one latest stored price per active symbol. It lets portfolio and quote tools
+degrade safely without granting `mcp_connector` direct access to
+`dbo.SeriesData`. Portfolio market values remain null when no stored price is
+available; cost basis is never substituted for market value.
 
 Migration `012` adds the least-privilege WiseLinePortal contract. It provisions
 portal identities idempotently, synchronizes paid/trial entitlement boundaries,
@@ -380,16 +388,19 @@ trading operations:
 
 - `search_symbols` searches SQL first, then Schwab instrument lookup.
 - `get_symbol_profile` merges Schwab fundamentals with local metadata.
-- `get_latest_prices` uses current Schwab quotes, with SQL fallback.
+- `get_latest_prices` uses current Schwab quotes, with stored SQL fallback for
+  provider errors and internal rate limits.
 - `get_price_history` uses SQL history first and Schwab for unknown symbols.
 - `get_market_hours` supports equity, bond, futures, and forex markets.
 - `get_market_movers` supports equity markets and major indexes.
 
-Responses are normalized before being returned. In-memory caching uses 15
+Responses are normalized before being returned. In-memory caching uses 60
 seconds for quotes, 60 seconds for movers, five minutes for market hours, 15
-minutes for external price history, and one hour for instrument data. The cache
-reduces duplicate upstream requests across MCP users and never stores Schwab
-access or refresh tokens.
+minutes for external price history, and one hour for instrument data. Quote
+responses may be served stale for up to 15 minutes when Schwab is unavailable,
+and identical concurrent cache misses are coalesced into one provider request.
+The cache reduces duplicate upstream requests across MCP users and never stores
+Schwab access or refresh tokens.
 
 ## Rate limits and Schwab units
 
@@ -413,9 +424,9 @@ symbols, 2 for 51-100, 3 for 101-150, and 4 for 151-200. External price history
 costs 5 units. A Schwab HTTP 401 retry consumes another global upstream request
 but does not charge the user twice for the same logical cache miss.
 
-When a limit is reached, the tool returns a structured error containing
-`error=rate_limit_exceeded`, a safe human-readable `message`, the limiting
-scope, and `retry_after_seconds`.
+When a limit is reached and no stored or stale price is available, the tool
+returns a structured error containing `error=rate_limit_exceeded`, a safe
+human-readable `message`, the limiting scope, and `retry_after_seconds`.
 Because MCP tool failures are JSON-RPC results, this retry value is carried in
 the tool error rather than an HTTP `Retry-After` response header.
 

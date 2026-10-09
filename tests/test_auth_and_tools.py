@@ -7,7 +7,10 @@ import re
 import struct
 import unittest
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
+from threading import Barrier, Thread
+from time import sleep
 from unittest.mock import call, patch
 from urllib.error import HTTPError
 from urllib.parse import parse_qs
@@ -474,6 +477,82 @@ class ConnectedProfileTests(unittest.TestCase):
 
 
 class PortfolioContextTests(unittest.TestCase):
+    def test_portfolio_uses_stored_prices_and_never_cost_basis_for_market_value(
+        self,
+    ) -> None:
+        account_id = "00000000-0000-0000-0000-000000000010"
+        account = {
+            "AccountId": account_id,
+            "AccountName": "Retirement",
+            "BaseCurrency": "USD",
+        }
+        balance = {
+            "AccountId": account_id,
+            "Currency": "USD",
+            "TotalAmount": Decimal("10000"),
+            "AsOf": "2026-10-09",
+        }
+        position = {
+            "AccountId": account_id,
+            "Symbol": "VOO",
+            "Quantity": Decimal("2"),
+            "OpeningCostBasis": Decimal("1000"),
+            "LastPrice": Decimal("712.34"),
+            "PriceAsOf": "2026-10-09",
+            "MarketValue": Decimal("1424.68"),
+            "ValuationSource": "stored_market_price",
+        }
+        with patch.object(
+            server,
+            "_current_user_id",
+            return_value="00000000-0000-0000-0000-000000000001",
+        ), patch.object(
+            server,
+            "_fetch_all",
+            side_effect=[[account], [balance], [position], []],
+        ) as fetch_all:
+            result = server.get_my_portfolio(None, account_id)
+
+        valued_account = result["accounts"][0]
+        self.assertEqual(valued_account["CashMarketValue"], Decimal("10000"))
+        self.assertEqual(
+            valued_account["PositionMarketValue"],
+            Decimal("1424.68"),
+        )
+        self.assertEqual(valued_account["TotalMarketValue"], Decimal("11424.68"))
+        self.assertEqual(valued_account["UnpricedPositionCount"], 0)
+        self.assertEqual(valued_account["ValuationSource"], "stored_market_prices")
+        self.assertFalse(
+            result["valuation_policy"]["cost_basis_used_as_market_value"]
+        )
+        positions_sql = fetch_all.call_args_list[2].args[0]
+        self.assertIn("invest.McpLatestPrices", positions_sql)
+        self.assertIn("WHEN prices.LastPrice IS NULL THEN NULL", positions_sql)
+        self.assertNotIn("COALESCE(prices.LastPrice", positions_sql)
+
+    def test_portfolio_marks_total_value_incomplete_when_a_position_is_unpriced(
+        self,
+    ) -> None:
+        account = {"AccountId": "account-1", "BaseCurrency": "USD"}
+        balance = {
+            "AccountId": "account-1",
+            "Currency": "USD",
+            "TotalAmount": Decimal("100"),
+        }
+        position = {
+            "AccountId": "account-1",
+            "Symbol": "UNKNOWN",
+            "OpeningCostBasis": Decimal("500"),
+            "MarketValue": None,
+        }
+
+        server._attach_account_valuations([account], [balance], [position])
+
+        self.assertIsNone(account["PositionMarketValue"])
+        self.assertIsNone(account["TotalMarketValue"])
+        self.assertEqual(account["UnpricedPositionCount"], 1)
+        self.assertEqual(account["ValuationSource"], "incomplete")
+
     def test_portfolio_context_includes_applicable_strategy_rules(self) -> None:
         account_id = "00000000-0000-0000-0000-000000000010"
         strategy = {
@@ -1151,6 +1230,62 @@ class SchwabMarketDataToolTests(unittest.TestCase):
         self.assertEqual(rows[0]["Symbol"], "VOO")
         self.assertEqual(rows[0]["LastPrice"], 712.34)
         self.assertEqual(rows[0]["Source"], "Schwab")
+        self.assertEqual(rows[0]["LiveQuoteStatus"], "live")
+
+    def test_rate_limited_quotes_fall_back_to_latest_stored_price(self) -> None:
+        rate_error = server.RateLimitExceeded(
+            "schwab_global_minute",
+            54,
+            limit=1,
+            unit="requests_per_minute",
+        )
+        stored = {
+            "Symbol": "VOO",
+            "Name": "Vanguard S&P 500 ETF",
+            "LastPrice": Decimal("712.34"),
+            "PriceDate": "2026-10-09",
+            "PriceUpdatedAt": "2026-10-09T12:00:00Z",
+            "AssetType": "EQUITY",
+            "AssetSubType": "ETF",
+            "Exchange": "NYSE Arca",
+        }
+        with patch.object(
+            server,
+            "_current_user_id",
+            return_value="user-1",
+        ), patch.object(
+            server,
+            "_schwab_cached_market_data_get",
+            side_effect=rate_error,
+        ), patch.object(server, "_fetch_all", return_value=[stored]) as fetch_all:
+            rows = server.get_latest_prices(None, ["VOO"])
+
+        self.assertEqual(rows[0]["LastPrice"], Decimal("712.34"))
+        self.assertFalse(rows[0]["Realtime"])
+        self.assertEqual(rows[0]["Source"], "SQL")
+        self.assertEqual(rows[0]["ValuationSource"], "stored_market_price")
+        self.assertEqual(rows[0]["LiveQuoteStatus"], "rate_limited")
+        self.assertIn("FROM invest.McpLatestPrices", fetch_all.call_args.args[0])
+
+    def test_rate_limited_quotes_raise_when_no_stored_price_exists(self) -> None:
+        rate_error = server.RateLimitExceeded(
+            "schwab_global_minute",
+            1,
+            limit=60,
+            unit="requests_per_minute",
+        )
+        with patch.object(
+            server,
+            "_current_user_id",
+            return_value="user-1",
+        ), patch.object(
+            server,
+            "_schwab_cached_market_data_get",
+            side_effect=rate_error,
+        ), patch.object(server, "_fetch_all", return_value=[]), self.assertRaises(
+            server.RateLimitExceeded
+        ):
+            server.get_latest_prices(None, ["UNKNOWN"])
 
     def test_symbol_search_uses_schwab_when_local_database_has_no_match(self) -> None:
         payload = {
@@ -1247,6 +1382,107 @@ class SchwabMarketDataToolTests(unittest.TestCase):
         self.assertEqual(metrics.schwab_units, 1)
         self.assertEqual(metrics.schwab_cache_hits, 1)
         self.assertEqual(second, {"value": [1]})
+
+    def test_cache_coalesces_simultaneous_provider_requests(self) -> None:
+        server._SCHWAB_RESPONSE_CACHE.clear()
+        server._SCHWAB_CACHE_KEY_LOCKS.clear()
+        start = Barrier(3)
+        results: list[dict[str, list[int]]] = []
+
+        def provider_get(*_args, **_kwargs):
+            sleep(0.05)
+            return {"value": [1]}
+
+        def worker() -> None:
+            start.wait()
+            results.append(
+                server._schwab_cached_market_data_get(
+                    "/quotes",
+                    {"symbols": "VOO"},
+                    ttl_seconds=60,
+                    user_id="user-1",
+                )
+            )
+
+        with patch.object(
+            server,
+            "_schwab_market_data_get",
+            side_effect=provider_get,
+        ) as provider, patch.object(
+            server,
+            "_reserve_schwab_user_capacity",
+            return_value=[],
+        ) as reserve:
+            threads = [Thread(target=worker), Thread(target=worker)]
+            for thread in threads:
+                thread.start()
+            start.wait()
+            for thread in threads:
+                thread.join(timeout=2)
+
+        self.assertEqual(results, [{"value": [1]}, {"value": [1]}])
+        provider.assert_called_once()
+        reserve.assert_called_once()
+
+    def test_expired_quote_cache_is_used_when_provider_is_unavailable(self) -> None:
+        server._SCHWAB_RESPONSE_CACHE.clear()
+        server._SCHWAB_CACHE_KEY_LOCKS.clear()
+        with patch.object(
+            server,
+            "_reserve_schwab_user_capacity",
+            return_value=[],
+        ), patch.object(
+            server,
+            "_schwab_market_data_get",
+            side_effect=[{"VOO": {"symbol": "VOO"}}, server.SchwabApiError("down")],
+        ):
+            server._schwab_cached_market_data_get(
+                "/quotes",
+                {"symbols": "VOO"},
+                ttl_seconds=0,
+                stale_ttl_seconds=900,
+                user_id="user-1",
+            )
+            cached = server._schwab_cached_market_data_get(
+                "/quotes",
+                {"symbols": "VOO"},
+                ttl_seconds=60,
+                stale_ttl_seconds=900,
+                user_id="user-1",
+            )
+
+        self.assertEqual(cached["__wiseline_cache_status"], "stale")
+        self.assertEqual(cached["VOO"]["symbol"], "VOO")
+
+    def test_shared_limit_refunds_reserved_user_capacity(self) -> None:
+        server._SCHWAB_RESPONSE_CACHE.clear()
+        server._SCHWAB_CACHE_KEY_LOCKS.clear()
+        reservations = [(object(), "user-1", 1)]
+        rate_error = server.RateLimitExceeded(
+            "schwab_global_minute",
+            1,
+            limit=60,
+            unit="requests_per_minute",
+        )
+        with patch.object(
+            server,
+            "_reserve_schwab_user_capacity",
+            return_value=reservations,
+        ), patch.object(
+            server,
+            "_schwab_market_data_get",
+            side_effect=rate_error,
+        ), patch.object(server, "_refund_schwab_user_capacity") as refund, self.assertRaises(
+            server.RateLimitExceeded
+        ):
+            server._schwab_cached_market_data_get(
+                "/quotes",
+                {"symbols": "VOO"},
+                ttl_seconds=60,
+                user_id="user-1",
+            )
+
+        refund.assert_called_once_with(reservations)
 
     def test_quotes_reject_more_than_two_hundred_unique_symbols(self) -> None:
         symbols = [f"S{index}" for index in range(201)]
@@ -1538,6 +1774,7 @@ class InstrumentViewSafetyTests(unittest.TestCase):
         )
         self.assertIn("FROM invest.McpInstruments", source)
         self.assertIn("JOIN invest.McpInstruments", source)
+        self.assertIn("FROM invest.McpLatestPrices", source)
 
     def test_migration_filters_internal_series_and_restricts_table(self) -> None:
         migration = (
@@ -1568,6 +1805,25 @@ class InstrumentViewSafetyTests(unittest.TestCase):
             "GRANT SELECT ON OBJECT::invest.McpInstruments TO [mcp_connector]",
             migration,
         )
+
+    def test_latest_price_migration_is_least_privilege(self) -> None:
+        migration = (
+            Path(server.__file__).parent
+            / "sql"
+            / "021_add_mcp_latest_prices.sql"
+        ).read_text(encoding="utf-8-sig")
+
+        self.assertIn("CREATE OR ALTER VIEW invest.McpLatestPrices", migration)
+        self.assertIn("FROM dbo.SeriesData AS data", migration)
+        self.assertIn(
+            "DENY SELECT ON OBJECT::dbo.SeriesData TO [mcp_connector]",
+            migration,
+        )
+        self.assertIn(
+            "GRANT SELECT ON OBJECT::invest.McpLatestPrices TO [mcp_connector]",
+            migration,
+        )
+        self.assertNotIn("GRANT SELECT ON OBJECT::dbo.SeriesData", migration)
 
     def test_membership_tools_use_research_procedure_filters(self) -> None:
         with patch.object(

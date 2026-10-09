@@ -172,9 +172,25 @@ SCORING_PERSIST_SNAPSHOTS = os.getenv(
     "true",
 ).lower() in {"1", "true", "yes", "on"}
 
+
+@dataclass(frozen=True)
+class _SchwabResponseCacheEntry:
+    fresh_until: float
+    stale_until: float
+    payload: Any
+    status: str = "fresh"
+
+
+@dataclass
+class _SchwabCacheKeyLock:
+    lock: threading.Lock
+    users: int = 0
+
+
 _SCHWAB_TOKEN_REFRESH_LOCK = threading.Lock()
 _SCHWAB_RESPONSE_CACHE_LOCK = threading.Lock()
-_SCHWAB_RESPONSE_CACHE: dict[str, tuple[float, Any]] = {}
+_SCHWAB_RESPONSE_CACHE: dict[str, _SchwabResponseCacheEntry] = {}
+_SCHWAB_CACHE_KEY_LOCKS: dict[str, _SchwabCacheKeyLock] = {}
 
 READ_ONLY_TOOL = ToolAnnotations(
     readOnlyHint=True,
@@ -1592,7 +1608,7 @@ def _reserve_schwab_user_capacity(
     units: int,
     *,
     is_history: bool,
-) -> None:
+) -> list[tuple[Any, str, int]]:
     reservations: list[tuple[Any, str, int]] = []
 
     def reserve(
@@ -1659,6 +1675,14 @@ def _reserve_schwab_user_capacity(
             SCHWAB_HISTORY_DAILY_CALLS,
             "calls_per_utc_day",
         )
+    return reservations
+
+
+def _refund_schwab_user_capacity(
+    reservations: list[tuple[Any, str, int]],
+) -> None:
+    for limiter, key, amount in reversed(reservations):
+        limiter.refund(key, amount)
 
 
 @contextmanager
@@ -1948,6 +1972,25 @@ def _schwab_market_data_get(
     raise SchwabApiError("Schwab market data authorization failed.")
 
 
+@contextmanager
+def _schwab_cache_key_slot(cache_key: str):
+    with _SCHWAB_RESPONSE_CACHE_LOCK:
+        lock_entry = _SCHWAB_CACHE_KEY_LOCKS.setdefault(
+            cache_key,
+            _SchwabCacheKeyLock(threading.Lock()),
+        )
+        lock_entry.users += 1
+    lock_entry.lock.acquire()
+    try:
+        yield
+    finally:
+        lock_entry.lock.release()
+        with _SCHWAB_RESPONSE_CACHE_LOCK:
+            lock_entry.users -= 1
+            if lock_entry.users == 0 and cache_key not in _SCHWAB_RESPONSE_CACHE:
+                _SCHWAB_CACHE_KEY_LOCKS.pop(cache_key, None)
+
+
 def _schwab_cached_market_data_get(
     path: str,
     params: dict[str, Any] | None = None,
@@ -1956,6 +1999,7 @@ def _schwab_cached_market_data_get(
     user_id: str,
     units: int = 1,
     is_history: bool = False,
+    stale_ttl_seconds: int = 0,
 ) -> Any:
     cache_key = json.dumps(
         {"path": path, "params": params or {}},
@@ -1963,40 +2007,109 @@ def _schwab_cached_market_data_get(
         separators=(",", ":"),
         default=str,
     )
+    def cached_payload(entry: _SchwabResponseCacheEntry) -> Any:
+        request_metrics = _REQUEST_USAGE_METRICS.get()
+        if request_metrics is not None:
+            request_metrics.schwab_cache_hits += 1
+        payload_copy = deepcopy(entry.payload)
+        if entry.status == "stale" and isinstance(payload_copy, dict):
+            payload_copy["__wiseline_cache_status"] = "stale"
+        return payload_copy
+
     now = monotonic()
     with _SCHWAB_RESPONSE_CACHE_LOCK:
         cached = _SCHWAB_RESPONSE_CACHE.get(cache_key)
-        if cached and cached[0] > now:
-            request_metrics = _REQUEST_USAGE_METRICS.get()
-            if request_metrics is not None:
-                request_metrics.schwab_cache_hits += 1
-            return deepcopy(cached[1])
+        if cached and cached.fresh_until > now:
+            return cached_payload(cached)
 
-    _reserve_schwab_user_capacity(user_id, units, is_history=is_history)
-    request_metrics = _REQUEST_USAGE_METRICS.get()
-    if request_metrics is not None:
-        request_metrics.schwab_units += max(1, int(units))
-    payload = _schwab_market_data_get(path, params)
-    with _SCHWAB_RESPONSE_CACHE_LOCK:
-        if len(_SCHWAB_RESPONSE_CACHE) >= 1000:
-            expired_keys = [
-                key
-                for key, (expires_at, _) in _SCHWAB_RESPONSE_CACHE.items()
-                if expires_at <= now
-            ]
-            for key in expired_keys:
-                _SCHWAB_RESPONSE_CACHE.pop(key, None)
-            if len(_SCHWAB_RESPONSE_CACHE) >= 1000:
-                oldest_key = min(
-                    _SCHWAB_RESPONSE_CACHE,
-                    key=lambda key: _SCHWAB_RESPONSE_CACHE[key][0],
-                )
-                _SCHWAB_RESPONSE_CACHE.pop(oldest_key, None)
-        _SCHWAB_RESPONSE_CACHE[cache_key] = (
-            monotonic() + max(0, ttl_seconds),
-            deepcopy(payload),
+    # Only one request per exact provider query may refresh an expired entry.
+    # Waiters re-check the cache after the leader completes instead of creating
+    # a thundering herd against the shared Schwab application.
+    with _schwab_cache_key_slot(cache_key):
+        now = monotonic()
+        with _SCHWAB_RESPONSE_CACHE_LOCK:
+            cached = _SCHWAB_RESPONSE_CACHE.get(cache_key)
+            if cached and cached.fresh_until > now:
+                return cached_payload(cached)
+            stale = (
+                cached
+                if cached
+                and stale_ttl_seconds > 0
+                and cached.stale_until > now
+                else None
+            )
+
+        reservations = _reserve_schwab_user_capacity(
+            user_id,
+            units,
+            is_history=is_history,
         )
-    return payload
+        request_metrics = _REQUEST_USAGE_METRICS.get()
+        if request_metrics is not None:
+            request_metrics.schwab_units += max(1, int(units))
+        try:
+            payload = _schwab_market_data_get(path, params)
+        except RateLimitExceeded:
+            # The shared limiter rejected this request before it reached Schwab,
+            # so it must not consume the caller's minute or daily allowance.
+            _refund_schwab_user_capacity(reservations)
+            if request_metrics is not None:
+                request_metrics.schwab_units = max(
+                    0,
+                    request_metrics.schwab_units - max(1, int(units)),
+                )
+            if stale is None:
+                raise
+            stale_entry = _SchwabResponseCacheEntry(
+                fresh_until=monotonic() + 15,
+                stale_until=stale.stale_until,
+                payload=stale.payload,
+                status="stale",
+            )
+            with _SCHWAB_RESPONSE_CACHE_LOCK:
+                _SCHWAB_RESPONSE_CACHE[cache_key] = stale_entry
+            return cached_payload(stale_entry)
+        except SchwabApiError:
+            if stale is None:
+                raise
+            stale_entry = _SchwabResponseCacheEntry(
+                fresh_until=monotonic() + 15,
+                stale_until=stale.stale_until,
+                payload=stale.payload,
+                status="stale",
+            )
+            with _SCHWAB_RESPONSE_CACHE_LOCK:
+                _SCHWAB_RESPONSE_CACHE[cache_key] = stale_entry
+            return cached_payload(stale_entry)
+
+        now = monotonic()
+        with _SCHWAB_RESPONSE_CACHE_LOCK:
+            if len(_SCHWAB_RESPONSE_CACHE) >= 1000:
+                expired_keys = [
+                    key
+                    for key, entry in _SCHWAB_RESPONSE_CACHE.items()
+                    if entry.stale_until <= now
+                ]
+                for key in expired_keys:
+                    _SCHWAB_RESPONSE_CACHE.pop(key, None)
+                    lock_entry = _SCHWAB_CACHE_KEY_LOCKS.get(key)
+                    if lock_entry is not None and lock_entry.users == 0:
+                        _SCHWAB_CACHE_KEY_LOCKS.pop(key, None)
+                if len(_SCHWAB_RESPONSE_CACHE) >= 1000:
+                    oldest_key = min(
+                        _SCHWAB_RESPONSE_CACHE,
+                        key=lambda key: _SCHWAB_RESPONSE_CACHE[key].stale_until,
+                    )
+                    _SCHWAB_RESPONSE_CACHE.pop(oldest_key, None)
+                    lock_entry = _SCHWAB_CACHE_KEY_LOCKS.get(oldest_key)
+                    if lock_entry is not None and lock_entry.users == 0:
+                        _SCHWAB_CACHE_KEY_LOCKS.pop(oldest_key, None)
+            _SCHWAB_RESPONSE_CACHE[cache_key] = _SchwabResponseCacheEntry(
+                fresh_until=now + max(0, ttl_seconds),
+                stale_until=now + max(0, ttl_seconds, stale_ttl_seconds),
+                payload=deepcopy(payload),
+            )
+        return payload
 
 
 def _epoch_milliseconds_to_iso(value: Any) -> str | None:
@@ -3140,9 +3253,53 @@ def get_symbol_profile(ctx: Context, symbol: str) -> dict[str, Any] | None:
     return merged
 
 
+def _stored_latest_price_rows(
+    symbols: list[str],
+    *,
+    live_quote_status: str,
+) -> list[dict[str, Any]]:
+    if not symbols:
+        return []
+    placeholders = ", ".join("?" for _ in symbols)
+    rows = _fetch_all(
+        f"""
+        SELECT
+            Symbol,
+            Name,
+            LastPrice,
+            PriceDate,
+            PriceUpdatedAt,
+            AssetType,
+            AssetSubType,
+            Exchange
+        FROM invest.McpLatestPrices
+        WHERE UPPER(Symbol) IN ({placeholders});
+        """,
+        tuple(symbols),
+    )
+    return [
+        {
+            "Symbol": row.get("Symbol"),
+            "Name": row.get("Name"),
+            "AssetType": row.get("AssetType"),
+            "AssetSubType": row.get("AssetSubType"),
+            "Exchange": row.get("Exchange"),
+            "Realtime": False,
+            "LastPrice": row.get("LastPrice"),
+            "PriceDate": row.get("PriceDate"),
+            "PriceAsOf": row.get("PriceDate"),
+            "Updated": row.get("PriceUpdatedAt"),
+            "Source": "SQL",
+            "ValuationSource": "stored_market_price",
+            "LiveQuoteStatus": live_quote_status,
+        }
+        for row in rows
+    ]
+
+
 @mcp.tool(annotations=OPEN_WORLD_READ_ONLY_TOOL)
 def get_latest_prices(ctx: Context, symbols: list[str]) -> list[dict[str, Any]]:
-    """Return current Schwab quotes for any symbols, with SQL fallback."""
+    """Return live quotes when available, otherwise latest stored market prices."""
     user_id = _current_user_id(ctx)
     cleaned = _clean_symbols(symbols)
     if len(cleaned) > SCHWAB_MAX_QUOTE_SYMBOLS:
@@ -3151,7 +3308,8 @@ def get_latest_prices(ctx: Context, symbols: list[str]) -> list[dict[str, Any]]:
             "unique symbols."
         )
     quote_by_symbol: dict[str, dict[str, Any]] = {}
-    schwab_error: SchwabApiError | None = None
+    provider_error: SchwabApiError | RateLimitExceeded | None = None
+    fallback_status = "not_returned"
     try:
         sorted_symbols = sorted(cleaned)
         for start in range(0, len(sorted_symbols), 200):
@@ -3163,64 +3321,45 @@ def get_latest_prices(ctx: Context, symbols: list[str]) -> list[dict[str, Any]]:
                     "fields": "quote,reference,fundamental",
                     "indicative": "false",
                 },
-                ttl_seconds=15,
+                ttl_seconds=60,
                 user_id=user_id,
                 units=max(1, (len(batch) + 49) // 50),
+                stale_ttl_seconds=900,
+            )
+            cache_status = (
+                payload.pop("__wiseline_cache_status", None)
+                if isinstance(payload, dict)
+                else None
             )
             for row in _schwab_quote_rows(payload, batch):
+                if cache_status == "stale":
+                    row["Realtime"] = False
+                    row["Source"] = "SchwabCache"
+                    row["ValuationSource"] = "cached_live_quote"
+                    row["LiveQuoteStatus"] = "stale_cache"
+                else:
+                    row["ValuationSource"] = "live_quote"
+                    row["LiveQuoteStatus"] = "live"
                 quote_by_symbol[str(row["Symbol"]).upper()] = row
-    except SchwabApiError as exc:
-        schwab_error = exc
+    except (SchwabApiError, RateLimitExceeded) as exc:
+        provider_error = exc
+        fallback_status = (
+            "rate_limited" if isinstance(exc, RateLimitExceeded) else "provider_unavailable"
+        )
         LOGGER.warning("Schwab quotes failed; trying SQL fallback.")
 
     missing = [symbol for symbol in cleaned if symbol not in quote_by_symbol]
     if missing:
-        placeholders = ", ".join("?" for _ in missing)
-        local_rows = _fetch_all(
-            f"""
-            SELECT
-                i.Symbol,
-                i.Name,
-                latest.LastValue AS LastPrice,
-                latest.PriceDate,
-                latest.Updated,
-                i.AssetType,
-                i.AssetSubType,
-                i.Exchange
-            FROM invest.McpInstruments i
-            OUTER APPLY
-            (
-                SELECT TOP (1)
-                    sd.LastValue,
-                    sd.Date AS PriceDate,
-                    sd.Updated
-                FROM dbo.SeriesData sd
-                WHERE sd.SeriesId = i.SeriesId
-                ORDER BY sd.Date DESC
-            ) latest
-            WHERE UPPER(i.Symbol) IN ({placeholders});
-            """,
-            tuple(missing),
-        )
-        for row in local_rows:
-            normalized = {
-                "Symbol": row.get("Symbol"),
-                "Name": row.get("Name"),
-                "AssetType": row.get("AssetType"),
-                "AssetSubType": row.get("AssetSubType"),
-                "Exchange": row.get("Exchange"),
-                "Realtime": False,
-                "LastPrice": row.get("LastPrice"),
-                "PriceDate": row.get("PriceDate"),
-                "Updated": row.get("Updated"),
-                "Source": "SQL",
-            }
-            symbol_key = str(row.get("Symbol") or "").upper()
+        for normalized in _stored_latest_price_rows(
+            missing,
+            live_quote_status=fallback_status,
+        ):
+            symbol_key = str(normalized.get("Symbol") or "").upper()
             if symbol_key:
                 quote_by_symbol[symbol_key] = normalized
 
-    if schwab_error and not quote_by_symbol:
-        raise schwab_error
+    if provider_error and not quote_by_symbol:
+        raise provider_error
     return [quote_by_symbol[symbol] for symbol in cleaned if symbol in quote_by_symbol]
 
 
@@ -4069,15 +4208,99 @@ def create_account(
     )
 
 
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except (ValueError, ArithmeticError):
+        return None
+
+
+def _attach_account_valuations(
+    accounts: list[dict[str, Any]],
+    balances: list[dict[str, Any]],
+    positions: list[dict[str, Any]],
+) -> None:
+    for account in accounts:
+        account_id = str(account.get("AccountId") or "")
+        base_currency = str(account.get("BaseCurrency") or "USD").upper()
+        account_balances = [
+            balance
+            for balance in balances
+            if str(balance.get("AccountId") or "") == account_id
+            and str(balance.get("Currency") or "").upper() == base_currency
+        ]
+        account_positions = [
+            position
+            for position in positions
+            if str(position.get("AccountId") or "") == account_id
+        ]
+
+        cash_market_value = sum(
+            (
+                amount
+                for balance in account_balances
+                if (amount := _decimal_or_none(balance.get("TotalAmount"))) is not None
+            ),
+            Decimal("0"),
+        )
+        position_values = [
+            value
+            for position in account_positions
+            if (value := _decimal_or_none(position.get("MarketValue"))) is not None
+        ]
+        unpriced_count = len(account_positions) - len(position_values)
+        position_market_value = sum(position_values, Decimal("0"))
+        total_market_value = (
+            None
+            if unpriced_count
+            else cash_market_value + position_market_value
+        )
+
+        price_dates = [
+            position.get("PriceAsOf") or position.get("PriceDate")
+            for position in account_positions
+            if position.get("PriceAsOf") is not None
+            or position.get("PriceDate") is not None
+        ]
+        balance_dates = [
+            balance.get("AsOf")
+            for balance in account_balances
+            if balance.get("AsOf") is not None
+        ]
+        valuation_dates = price_dates + balance_dates
+
+        account["CashMarketValue"] = cash_market_value
+        account["PositionMarketValue"] = (
+            None if unpriced_count else position_market_value
+        )
+        account["TotalMarketValue"] = total_market_value
+        account["UnpricedPositionCount"] = unpriced_count
+        account["ValuationAsOf"] = (
+            min(valuation_dates, key=lambda value: str(value))
+            if valuation_dates
+            else None
+        )
+        account["ValuationSource"] = (
+            "incomplete"
+            if unpriced_count
+            else "stored_market_prices"
+            if account_positions
+            else "cash_only"
+        )
+
+
 @mcp.tool(annotations=READ_ONLY_TOOL)
 def get_my_portfolio(
     ctx: Context,
     account_id: str | None = None,
 ) -> dict[str, Any]:
-    """Return caller-owned accounts, balances, positions, and applicable strategy rules.
+    """Return caller-owned accounts, stored-price valuations, and strategy rules.
 
     Strategy rules with a null AccountId apply across all of the caller's portfolios.
     Account-specific rules apply only to the matching portfolio.
+    Cost basis is never substituted for a missing market price or market value.
     """
     user_id = _current_user_id(ctx)
     normalized_account_id = (
@@ -4130,9 +4353,11 @@ def get_my_portfolio(
     )
     positions = _fetch_all(
         f"""
+        ;WITH PositionTotals AS
+        (
         SELECT
             t.AccountId,
-            t.Symbol,
+            UPPER(LTRIM(RTRIM(t.Symbol))) AS Symbol,
             SUM(
                 CASE
                     WHEN UPPER(t.TransactionType) IN
@@ -4182,7 +4407,7 @@ def get_my_portfolio(
           AND t.Symbol IS NOT NULL
           AND a.IsActive = 1
           {account_filter}
-        GROUP BY t.AccountId, t.Symbol
+        GROUP BY t.AccountId, UPPER(LTRIM(RTRIM(t.Symbol)))
         HAVING SUM(
             CASE
                 WHEN UPPER(t.TransactionType) IN
@@ -4193,7 +4418,33 @@ def get_my_portfolio(
                 ELSE 0
             END
         ) <> 0
-        ORDER BY t.AccountId, t.Symbol;
+        )
+        SELECT
+            p.AccountId,
+            p.Symbol,
+            p.Quantity,
+            p.LastActivityAt,
+            p.OpeningCostBasis,
+            p.OpeningAverageCost,
+            prices.LastPrice,
+            prices.PriceDate,
+            prices.PriceDate AS PriceAsOf,
+            prices.PriceUpdatedAt,
+            CAST(
+                CASE
+                    WHEN prices.LastPrice IS NULL THEN NULL
+                    ELSE p.Quantity * prices.LastPrice
+                END AS decimal(38, 10)
+            ) AS MarketValue,
+            CAST(0 AS bit) AS Realtime,
+            CASE
+                WHEN prices.LastPrice IS NULL THEN 'unpriced'
+                ELSE 'stored_market_price'
+            END AS ValuationSource
+        FROM PositionTotals AS p
+        LEFT JOIN invest.McpLatestPrices AS prices
+          ON UPPER(LTRIM(RTRIM(prices.Symbol))) = p.Symbol
+        ORDER BY p.AccountId, p.Symbol;
         """,
         params,
     )
@@ -4228,11 +4479,17 @@ def get_my_portfolio(
         """,
         params,
     )
+    _attach_account_valuations(accounts, balances, positions)
     return {
         "accounts": accounts,
         "cash_balances": balances,
         "positions": positions,
         "strategy_rules": strategy_rules,
+        "valuation_policy": {
+            "market_value_source": "latest_stored_market_prices",
+            "live_quotes_required": False,
+            "cost_basis_used_as_market_value": False,
+        },
     }
 
 
