@@ -473,6 +473,62 @@ class ConnectedProfileTests(unittest.TestCase):
         self.assertEqual(profile.nickname, "Andrey")
 
 
+class PortfolioContextTests(unittest.TestCase):
+    def test_portfolio_context_includes_applicable_strategy_rules(self) -> None:
+        account_id = "00000000-0000-0000-0000-000000000010"
+        strategy = {
+            "StrategyRuleId": "00000000-0000-0000-0000-000000000020",
+            "AccountId": account_id,
+            "RuleName": "Long-term growth",
+            "RuleType": "allocation",
+            "RuleJson": '{"targetEquityPercent":70}',
+            "Scope": "portfolio",
+            "IsEnabled": True,
+        }
+        with patch.object(
+            server,
+            "_current_user_id",
+            return_value="00000000-0000-0000-0000-000000000001",
+        ), patch.object(
+            server,
+            "_fetch_all",
+            side_effect=[
+                [{"AccountId": account_id, "AccountName": "Retirement"}],
+                [],
+                [{"AccountId": account_id, "Symbol": "VOO"}],
+                [strategy],
+            ],
+        ) as fetch_all:
+            result = server.get_my_portfolio(None, account_id)
+
+        self.assertEqual(result["strategy_rules"], [strategy])
+        self.assertEqual(fetch_all.call_count, 4)
+        strategy_sql, strategy_params = fetch_all.call_args_list[3].args
+        self.assertIn("FROM invest.StrategyRules", strategy_sql)
+        self.assertIn("sr.AccountId = ? OR sr.AccountId IS NULL", strategy_sql)
+        self.assertEqual(
+            strategy_params,
+            ("00000000-0000-0000-0000-000000000001", account_id),
+        )
+
+    def test_all_portfolios_include_global_and_portfolio_strategy_rules(self) -> None:
+        with patch.object(
+            server,
+            "_current_user_id",
+            return_value="user-1",
+        ), patch.object(
+            server,
+            "_fetch_all",
+            side_effect=[[{"AccountId": "account-1"}], [], [], []],
+        ) as fetch_all:
+            result = server.get_my_portfolio(None)
+
+        self.assertEqual(result["strategy_rules"], [])
+        strategy_sql, strategy_params = fetch_all.call_args_list[3].args
+        self.assertNotIn("sr.AccountId = ?", strategy_sql)
+        self.assertEqual(strategy_params, ("user-1",))
+
+
 class SharedPortfolioTests(unittest.TestCase):
     def test_shared_portfolio_scopes_every_query_to_active_view_grant(self) -> None:
         account_id = "00000000-0000-0000-0000-000000000010"
@@ -1614,6 +1670,29 @@ class PortalIntegrationMigrationTests(unittest.TestCase):
             migration,
         )
         self.assertNotIn("GRANT SELECT ON OBJECT::invest.ApiTokens", migration)
+
+
+class PortalStrategyMigrationTests(unittest.TestCase):
+    def test_portal_strategy_contract_is_scoped_and_least_privilege(self) -> None:
+        migration = (
+            Path(server.__file__).parent
+            / "sql"
+            / "020_add_portal_strategy_context.sql"
+        ).read_text(encoding="utf-8-sig")
+
+        self.assertIn(
+            "CREATE OR ALTER PROCEDURE invest.Portal_GetPortfolioStrategies",
+            migration,
+        )
+        self.assertIn("r.UserId = @TradeUserId", migration)
+        self.assertIn("r.AccountId = @PortfolioId OR r.AccountId IS NULL", migration)
+        self.assertIn("a.OwnerUserId = @TradeUserId", migration)
+        self.assertIn("r.RuleJson", migration)
+        self.assertIn("TO [investment_portal_runtime]", migration)
+        self.assertIn(
+            "DENY EXECUTE ON OBJECT::invest.Portal_GetPortfolioStrategies",
+            migration,
+        )
 
 
 if __name__ == "__main__":

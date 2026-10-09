@@ -4074,7 +4074,11 @@ def get_my_portfolio(
     ctx: Context,
     account_id: str | None = None,
 ) -> dict[str, Any]:
-    """Return caller-owned accounts, cash balances, and transaction-derived positions."""
+    """Return caller-owned accounts, balances, positions, and applicable strategy rules.
+
+    Strategy rules with a null AccountId apply across all of the caller's portfolios.
+    Account-specific rules apply only to the matching portfolio.
+    """
     user_id = _current_user_id(ctx)
     normalized_account_id = (
         _canonical_uuid(account_id, "account_id") if account_id else None
@@ -4193,7 +4197,43 @@ def get_my_portfolio(
         """,
         params,
     )
-    return {"accounts": accounts, "cash_balances": balances, "positions": positions}
+    strategy_filter = (
+        "AND (sr.AccountId = ? OR sr.AccountId IS NULL)"
+        if normalized_account_id
+        else ""
+    )
+    strategy_rules = _fetch_all(
+        f"""
+        SELECT
+            sr.StrategyRuleId,
+            sr.AccountId,
+            sr.RuleName,
+            sr.RuleType,
+            sr.RuleJson,
+            CASE
+                WHEN sr.AccountId IS NULL THEN 'global'
+                ELSE 'portfolio'
+            END AS Scope,
+            sr.IsEnabled,
+            sr.UpdatedAt,
+            sr.RowVersion
+        FROM invest.StrategyRules sr
+        WHERE sr.UserId = ?
+          AND sr.IsEnabled = 1
+          {strategy_filter}
+        ORDER BY
+            CASE WHEN sr.AccountId IS NULL THEN 1 ELSE 0 END,
+            sr.RuleName,
+            sr.StrategyRuleId;
+        """,
+        params,
+    )
+    return {
+        "accounts": accounts,
+        "cash_balances": balances,
+        "positions": positions,
+        "strategy_rules": strategy_rules,
+    }
 
 
 @mcp.tool(annotations=WRITE_TOOL)
